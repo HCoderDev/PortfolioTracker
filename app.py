@@ -139,6 +139,30 @@ def format_signed_compact_inr(value: float) -> str:
     return f"{sign}{format_compact_inr(abs(value))}"
 
 
+def calculate_months_remaining(target_date_str: str) -> int:
+    try:
+        target_date = datetime.strptime(target_date_str, "%Y-%m-%d")
+        now = datetime.now()
+        months = (target_date.year - now.year) * 12 + (target_date.month - now.month)
+        return max(0, months)
+    except Exception:
+        return 0
+
+
+def calculate_required_pmt(fv: float, pv: float, annual_rate_pct: float, months: int) -> float:
+    if fv <= pv or months <= 0:
+        return 0.0
+        
+    if annual_rate_pct <= 0:
+        return (fv - pv) / months
+        
+    r = (annual_rate_pct / 100.0) / 12.0
+    # PMT = (FV - PV * (1 + r)^n) * r / ((1 + r)^n - 1)
+    fv_compounded = pv * ((1 + r) ** months)
+    pmt = (fv - fv_compounded) * r / (((1 + r) ** months) - 1)
+    return max(0.0, pmt)
+
+
 def format_percent(value: float) -> str:
     return f"{value:+.1f}%"
 
@@ -297,6 +321,90 @@ class ChartHoverFilter(QObject):
         return super().eventFilter(obj, event)
 
 
+class GoalCard(QFrame):
+    def __init__(self, goal_data, current_savings, months_remaining, pmt):
+        super().__init__()
+        self.setObjectName("goalCard")
+        self.setStyleSheet("QFrame#goalCard { background-color: #ffffff; border: 1px solid #d9d8d3; border-radius: 8px; }")
+        self.setFixedWidth(340)
+        self.setFixedHeight(180)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+        
+        # Header
+        header = QHBoxLayout()
+        name_lbl = QLabel(goal_data["name"])
+        name_lbl.setStyleSheet('font-family: "Segoe UI", sans-serif; font-size: 15px; font-weight: bold; color: #22211f; border: none;')
+        header.addWidget(name_lbl)
+        header.addStretch()
+        layout.addLayout(header)
+        
+        # Subtitle
+        year_str = goal_data["target_date"][:4]
+        cat_str = goal_data["asset_class_key"] or ("All Categories" if not goal_data.get("linked_asset_ids") else "Specific Assets")
+        sub_lbl = QLabel(f"by {year_str} • {cat_str}")
+        sub_lbl.setStyleSheet("font-size: 12px; color: #6b6962; border: none;")
+        layout.addWidget(sub_lbl)
+        
+        layout.addSpacing(8)
+        
+        # Progress Bar 1: Savings
+        savings_row = QHBoxLayout()
+        s_lbl1 = QLabel("Savings")
+        s_lbl1.setStyleSheet("font-size: 11px; color: #2b7a52; border: none;")
+        
+        target = goal_data["target_amount"]
+        pct = (current_savings / target) * 100 if target > 0 else 0
+        pct = min(100, max(0, pct))
+        
+        s_lbl2 = QLabel(f"{int(pct)}%")
+        s_lbl2.setStyleSheet("font-size: 11px; color: #2b7a52; font-weight: bold; border: none;")
+        savings_row.addWidget(s_lbl1)
+        savings_row.addStretch()
+        savings_row.addWidget(s_lbl2)
+        
+        layout.addLayout(savings_row)
+        
+        # Custom Savings Bar
+        s_bar = QFrame()
+        s_bar.setFixedHeight(6)
+        s_bar.setStyleSheet("background-color: #e1e0db; border-radius: 3px; border: none;")
+        
+        s_fill = QFrame(s_bar)
+        s_fill.setStyleSheet("background-color: #2b7a52; border-radius: 3px; border: none;")
+        s_fill.setFixedHeight(6)
+        s_fill.setFixedWidth(int((pct / 100) * 300)) # Approx 340 minus margins
+        layout.addWidget(s_bar)
+        
+        # Text under savings bar
+        from app import format_compact_inr # Local import safe here
+        t_lbl = QLabel(f"{format_compact_inr(current_savings)} of {format_compact_inr(target)}")
+        t_lbl.setStyleSheet("font-size: 11px; color: #6b6962; border: none;")
+        t_lbl.setAlignment(Qt.AlignRight)
+        layout.addWidget(t_lbl)
+        
+        layout.addStretch()
+        
+        # Action string
+        if pct >= 100:
+            action_txt = "Goal Reached! 🎉"
+            action_color = "#2b7a52"
+            action_bg = "#e3efe8"
+        elif months_remaining <= 0:
+            action_txt = "Target date passed ⚠"
+            action_color = "#cc4b38"
+            action_bg = "#fae9e6"
+        else:
+            action_txt = f"✓ Invest {format_compact_inr(pmt)}/mo at {goal_data['expected_return_pct']}% p.a. to close gap"
+            action_color = "#2b7a52"
+            action_bg = "#e3efe8"
+            
+        action_pill = QLabel(action_txt)
+        action_pill.setStyleSheet(f"background-color: {action_bg}; color: {action_color}; border-radius: 4px; padding: 6px; font-size: 11px; font-weight: 500;")
+        layout.addWidget(action_pill)
+
 class PortfolioWindow(QMainWindow):
     ASSETS_PAGE_INDEX = 0
     LIABILITIES_PAGE_INDEX = 1
@@ -306,6 +414,7 @@ class PortfolioWindow(QMainWindow):
     ESSENTIALS_PAGE_INDEX = 5
     SETTINGS_PAGE_INDEX = 6
     ALLOCATION_PAGE_INDEX = 7
+    GOALS_PAGE_INDEX = 8
 
     def __init__(self) -> None:
         super().__init__()
@@ -1052,7 +1161,7 @@ class PortfolioWindow(QMainWindow):
                 button.setObjectName("navItem")
                 button.setProperty("active", item == "Assets")
                 button.setCursor(Qt.PointingHandCursor)
-                if item in {"Assets", "Liabilities", "Net Worth", "Essentials", "Allocation"}:
+                if item in {"Assets", "Liabilities", "Net Worth", "Essentials", "Allocation", "Goals"}:
                     button.clicked.connect(
                         lambda _checked=False, selected_item=item: self._on_sidebar_navigation(selected_item)
                     )
@@ -1079,6 +1188,7 @@ class PortfolioWindow(QMainWindow):
         self.content_stack.addWidget(self._build_essentials_page())
         self.content_stack.addWidget(self._build_settings_page())
         self.content_stack.addWidget(self._build_allocation_page())
+        self.content_stack.addWidget(self._build_goals_page())
         content_layout.addWidget(self.content_stack, 1)
         return content
 
@@ -4548,6 +4658,8 @@ class PortfolioWindow(QMainWindow):
                 self._show_essentials_page()
         elif item_name == "Allocation":
             self._show_allocation_page()
+        elif item_name == "Goals":
+            self._show_goals_page()
 
     def _set_net_worth_mode(self, mode: str) -> None:
         if self.net_worth_view_mode == mode:
@@ -4581,6 +4693,11 @@ class PortfolioWindow(QMainWindow):
     def _show_allocation_page(self) -> None:
         self._set_active_nav_item("Allocation")
         self.content_stack.setCurrentIndex(self.ALLOCATION_PAGE_INDEX)
+
+    def _show_goals_page(self) -> None:
+        self._set_active_nav_item("Goals")
+        self.content_stack.setCurrentIndex(self.GOALS_PAGE_INDEX)
+        self._refresh_goals_view()
 
     def _snapshot_mode_title(self, mode: str) -> str:
         if mode == "ASSETS":
@@ -5994,6 +6111,205 @@ class PortfolioWindow(QMainWindow):
             self.selected_category_key = None
             self.selected_class_filter_key = None
             self._show_assets_page()
+
+    def _build_goals_page(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        
+        container = QWidget()
+        container.setStyleSheet("background-color: transparent;")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setSpacing(32)
+        
+        # Section 1: Active Goals Gallery
+        self.active_goals_layout = QHBoxLayout()
+        self.active_goals_layout.setSpacing(16)
+        
+        goals_scroll = QScrollArea()
+        goals_scroll.setWidgetResizable(True)
+        goals_scroll.setFixedHeight(220)
+        goals_scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
+        goals_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        goals_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        
+        self.goals_container = QWidget()
+        self.goals_container.setStyleSheet("background-color: transparent;")
+        self.goals_container.setLayout(self.active_goals_layout)
+        goals_scroll.setWidget(self.goals_container)
+        
+        layout.addWidget(goals_scroll)
+        
+        # Section 2: Create Goal Form
+        create_panel = QFrame()
+        create_panel.setObjectName("targetPanel")
+        create_panel.setStyleSheet("QFrame#targetPanel { background-color: #ffffff; border: 1px solid #d9d8d3; border-radius: 6px; }")
+        create_layout = QVBoxLayout(create_panel)
+        create_layout.setContentsMargins(24, 24, 24, 24)
+        create_layout.setSpacing(16)
+        
+        create_title = QLabel("Create New Goal")
+        create_title.setStyleSheet('font-family: "Segoe UI", sans-serif; font-size: 14px; font-weight: bold; color: #22211f; border: none;')
+        create_layout.addWidget(create_title)
+        
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(12)
+        
+        # Row 0
+        grid.addWidget(QLabel("Goal Name *"), 0, 0)
+        self.goal_name_input = QLineEdit()
+        self.goal_name_input.setPlaceholderText("e.g. Dream House")
+        self.goal_name_input.setMinimumHeight(35)
+        self.goal_name_input.setStyleSheet("border: 1px solid #d9d8d3; border-radius: 4px; padding: 0 8px;")
+        grid.addWidget(self.goal_name_input, 1, 0)
+        
+        grid.addWidget(QLabel("Target Date *"), 0, 1)
+        self.goal_date_input = QLineEdit()
+        self.goal_date_input.setPlaceholderText("YYYY-MM-DD")
+        self.goal_date_input.setMinimumHeight(35)
+        self.goal_date_input.setStyleSheet("border: 1px solid #d9d8d3; border-radius: 4px; padding: 0 8px;")
+        grid.addWidget(self.goal_date_input, 1, 1)
+        
+        # Row 1
+        grid.addWidget(QLabel("Target Amount *"), 2, 0)
+        self.goal_amount_input = QLineEdit()
+        self.goal_amount_input.setPlaceholderText("e.g. 5000000")
+        self.goal_amount_input.setMinimumHeight(35)
+        self.goal_amount_input.setStyleSheet("border: 1px solid #d9d8d3; border-radius: 4px; padding: 0 8px;")
+        grid.addWidget(self.goal_amount_input, 3, 0)
+        
+        grid.addWidget(QLabel("Expected Return (% p.a.)"), 2, 1)
+        self.goal_return_input = QLineEdit("7.0")
+        self.goal_return_input.setMinimumHeight(35)
+        self.goal_return_input.setStyleSheet("border: 1px solid #d9d8d3; border-radius: 4px; padding: 0 8px;")
+        grid.addWidget(self.goal_return_input, 3, 1)
+        
+        create_layout.addLayout(grid)
+        
+        # Row 2: Tracking options
+        create_layout.addWidget(QLabel("Track Progress By"))
+        self.goal_class_combo = QComboBox()
+        self.goal_class_combo.setMinimumHeight(35)
+        self.goal_class_combo.setStyleSheet("border: 1px solid #d9d8d3; border-radius: 4px; padding: 0 8px;")
+        create_layout.addWidget(self.goal_class_combo)
+        
+        create_btn_row = QHBoxLayout()
+        self.create_goal_btn = QPushButton("Create Goal")
+        self.create_goal_btn.setObjectName("primaryButton")
+        self.create_goal_btn.setMinimumHeight(35)
+        self.create_goal_btn.setCursor(Qt.PointingHandCursor)
+        self.create_goal_btn.clicked.connect(self._on_create_goal)
+        create_btn_row.addStretch()
+        create_btn_row.addWidget(self.create_goal_btn)
+        
+        create_layout.addLayout(create_btn_row)
+        
+        layout.addWidget(create_panel)
+        layout.addStretch()
+        
+        scroll.setWidget(container)
+        return scroll
+
+    def _refresh_goals_view(self):
+        # Fetch goals and populate self.active_goals_layout
+        from db import fetch_categories, fetch_assets, fetch_goals
+        
+        # Clear Categories combo if needed and refill safely
+        current_idx = self.goal_class_combo.currentIndex()
+        self.goal_class_combo.blockSignals(True)
+        self.goal_class_combo.clear()
+        self.goal_class_combo.addItem("All Categories", "")
+        for cat in fetch_categories():
+            self.goal_class_combo.addItem(cat["category_name"], cat["category_key"])
+        if current_idx >= 0 and current_idx < self.goal_class_combo.count():
+            self.goal_class_combo.setCurrentIndex(current_idx)
+        self.goal_class_combo.blockSignals(False)
+        
+        # Clear existing GoalCards
+        for i in reversed(range(self.active_goals_layout.count())): 
+            item = self.active_goals_layout.itemAt(i)
+            if item.widget():
+                item.widget().setParent(None)
+                
+        # Fetch Data
+        assets = fetch_assets()
+        goals = fetch_goals()
+        
+        for g in goals:
+            target_amt = float(g["target_amount"])
+            ret_pct = float(g["expected_return_pct"])
+            months = calculate_months_remaining(g["target_date"])
+            
+            # Calculate PV
+            current_savings = 0.0
+            for a in assets:
+                is_linked = False
+                if g.get("linked_asset_ids") and a["id"] in g["linked_asset_ids"]:
+                    is_linked = True
+                elif not g.get("linked_asset_ids"):
+                    if not g.get("asset_class_key") or g.get("asset_class_key") == a["class_key"]:
+                        is_linked = True
+                
+                if is_linked:
+                    current_savings += float(a["value"])
+            
+            # Calculate PMT
+            pmt = calculate_required_pmt(target_amt, current_savings, ret_pct, months)
+            
+            card = GoalCard(g, current_savings, months, pmt)
+            self.active_goals_layout.addWidget(card)
+        
+        self.active_goals_layout.addStretch()
+
+    def _on_create_goal(self):
+        from db import create_goal
+        
+        name = self.goal_name_input.text().strip()
+        if not name:
+            self._show_error("Goal Name is required.")
+            return
+            
+        amt_str = self.goal_amount_input.text().strip()
+        try:
+            target_amount = float(amt_str)
+            if target_amount <= 0:
+                raise ValueError
+        except ValueError:
+            self._show_error("Target Amount must be a positive number.")
+            return
+            
+        date_str = self.goal_date_input.text().strip()
+        # Basic YYYY-MM-DD check
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            self._show_error("Date must be in YYYY-MM-DD format.")
+            return
+            
+        ret_str = self.goal_return_input.text().strip()
+        try:
+            ret_pct = float(ret_str)
+        except ValueError:
+            self._show_error("Expected Return must be a number.")
+            return
+            
+        cat_key = self.goal_class_combo.currentData()
+        if cat_key == "":
+            cat_key = None
+            
+        try:
+            create_goal(name, target_amount, date_str, ret_pct, cat_key, [])
+            self.goal_name_input.clear()
+            self.goal_amount_input.clear()
+            self.goal_date_input.clear()
+            self._show_success("Goal created successfully!")
+            self._refresh_goals_view()
+        except Exception as e:
+            self._show_error("Failed to create goal.")
+
 
 
 def run() -> None:

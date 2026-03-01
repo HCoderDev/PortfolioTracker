@@ -375,6 +375,7 @@ def init_db() -> None:
         _ensure_snapshot_line_items_tables(connection)
         _ensure_user_settings_table(connection)
         _ensure_exchange_rates_table(connection)
+        _ensure_goals_tables(connection)
         _seed_exchange_rates(connection)
         _migrate_assets(connection)
         _seed_default_assets(connection)
@@ -963,4 +964,78 @@ def update_base_currency(currency: str) -> None:
             "UPDATE user_settings SET base_currency = ? WHERE id = 1",
             (currency,),
         )
+        connection.commit()
+
+
+def _ensure_goals_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            target_amount REAL NOT NULL,
+            currency TEXT DEFAULT 'INR',
+            target_date TEXT NOT NULL,
+            expected_return_pct REAL DEFAULT 7.0,
+            asset_class_key TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS goal_linked_assets (
+            goal_id INTEGER NOT NULL,
+            asset_id INTEGER NOT NULL,
+            FOREIGN KEY (goal_id) REFERENCES goals(id) ON DELETE CASCADE,
+            FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE,
+            PRIMARY KEY (goal_id, asset_id)
+        )
+        """
+    )
+
+
+def create_goal(name: str, target_amount: float, target_date: str, expected_return_pct: float, asset_class_key: str | None, linked_asset_ids: list[int] = []) -> int:
+    with get_connection() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO goals (name, target_amount, currency, target_date, expected_return_pct, asset_class_key)
+            VALUES (?, ?, 'INR', ?, ?, ?)
+            """,
+            (name, target_amount, target_date, expected_return_pct, asset_class_key)
+        )
+        goal_id = cursor.lastrowid
+        
+        if linked_asset_ids:
+            for aid in linked_asset_ids:
+                cursor.execute("INSERT INTO goal_linked_assets (goal_id, asset_id) VALUES (?, ?)", (goal_id, aid))
+        
+        connection.commit()
+        return goal_id
+
+
+def fetch_goals() -> list[dict]:
+    with get_connection() as connection:
+        goals = connection.execute("SELECT * FROM goals").fetchall()
+        result = []
+        for g in goals:
+            goal_dict = dict(g)
+            links = connection.execute("SELECT asset_id FROM goal_linked_assets WHERE goal_id = ?", (g["id"],)).fetchall()
+            goal_dict["linked_asset_ids"] = [l["asset_id"] for l in links]
+            result.append(goal_dict)
+        return result
+
+
+def delete_goal(goal_id: int) -> None:
+    with get_connection() as connection:
+        connection.execute("DELETE FROM goal_linked_assets WHERE goal_id = ?", (goal_id,))
+        connection.execute("DELETE FROM goals WHERE id = ?", (goal_id,))
+        connection.commit()
+
+
+def link_goal_assets(goal_id: int, asset_ids: list[int]) -> None:
+    with get_connection() as connection:
+        connection.execute("DELETE FROM goal_linked_assets WHERE goal_id = ?", (goal_id,))
+        for aid in asset_ids:
+            connection.execute("INSERT INTO goal_linked_assets (goal_id, asset_id) VALUES (?, ?)", (goal_id, aid))
         connection.commit()
