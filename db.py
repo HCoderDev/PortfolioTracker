@@ -143,6 +143,86 @@ def _ensure_exchange_rates_table(connection: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_liabilities_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS liabilities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            liability_type TEXT NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'INR',
+            outstanding_amount REAL NOT NULL,
+            interest_rate REAL NOT NULL DEFAULT 0,
+            monthly_emi REAL NOT NULL DEFAULT 0,
+            start_date TEXT DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    columns = _table_columns(connection, "liabilities")
+    if "currency" not in columns:
+        connection.execute("ALTER TABLE liabilities ADD COLUMN currency TEXT NOT NULL DEFAULT 'INR'")
+    if "outstanding_amount" not in columns:
+        connection.execute("ALTER TABLE liabilities ADD COLUMN outstanding_amount REAL NOT NULL DEFAULT 0")
+    if "interest_rate" not in columns:
+        connection.execute("ALTER TABLE liabilities ADD COLUMN interest_rate REAL NOT NULL DEFAULT 0")
+    if "monthly_emi" not in columns:
+        connection.execute("ALTER TABLE liabilities ADD COLUMN monthly_emi REAL NOT NULL DEFAULT 0")
+    if "start_date" not in columns:
+        connection.execute("ALTER TABLE liabilities ADD COLUMN start_date TEXT DEFAULT ''")
+
+
+def _ensure_net_worth_snapshots_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS net_worth_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL DEFAULT '',
+            net_worth_inr REAL NOT NULL,
+            assets_total_inr REAL NOT NULL,
+            liabilities_total_inr REAL NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    columns = _table_columns(connection, "net_worth_snapshots")
+    if "label" not in columns:
+        connection.execute("ALTER TABLE net_worth_snapshots ADD COLUMN label TEXT NOT NULL DEFAULT ''")
+
+
+def _ensure_snapshot_line_items_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS snapshot_asset_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id INTEGER NOT NULL,
+            asset_name TEXT NOT NULL,
+            asset_class TEXT NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'INR',
+            original_value REAL NOT NULL,
+            value_inr REAL NOT NULL,
+            FOREIGN KEY (snapshot_id) REFERENCES net_worth_snapshots(id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS snapshot_liability_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id INTEGER NOT NULL,
+            liability_name TEXT NOT NULL,
+            liability_type TEXT NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'INR',
+            original_outstanding REAL NOT NULL,
+            outstanding_inr REAL NOT NULL,
+            FOREIGN KEY (snapshot_id) REFERENCES net_worth_snapshots(id)
+        )
+        """
+    )
+
+
 def _seed_exchange_rates(connection: sqlite3.Connection) -> None:
     connection.executemany(
         """
@@ -255,6 +335,9 @@ def init_db() -> None:
         _create_taxonomy_tables(connection)
         _seed_taxonomy(connection)
         _ensure_assets_table(connection)
+        _ensure_liabilities_table(connection)
+        _ensure_net_worth_snapshots_table(connection)
+        _ensure_snapshot_line_items_tables(connection)
         _ensure_exchange_rates_table(connection)
         _seed_exchange_rates(connection)
         _migrate_assets(connection)
@@ -330,6 +413,87 @@ def fetch_exchange_rates() -> dict[str, float]:
     rates = {row["currency_code"].upper(): float(row["inr_rate"]) for row in rows}
     rates["INR"] = 1.0
     return rates
+
+
+def fetch_liabilities() -> list[sqlite3.Row]:
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT
+                id,
+                name,
+                liability_type,
+                currency,
+                outstanding_amount,
+                interest_rate,
+                monthly_emi,
+                start_date,
+                created_at
+            FROM liabilities
+            ORDER BY outstanding_amount DESC, id DESC
+            """
+        ).fetchall()
+
+
+def fetch_net_worth_snapshots(limit: int | None = None) -> list[sqlite3.Row]:
+    query = """
+        SELECT
+            id,
+            label,
+            net_worth_inr,
+            assets_total_inr,
+            liabilities_total_inr,
+            created_at
+        FROM net_worth_snapshots
+        ORDER BY datetime(created_at) DESC, id DESC
+    """
+    params: tuple[object, ...] = ()
+    if limit is not None and limit > 0:
+        query += " LIMIT ?"
+        params = (int(limit),)
+
+    with get_connection() as connection:
+        return connection.execute(query, params).fetchall()
+
+
+def fetch_snapshot_asset_items(snapshot_id: int) -> list[sqlite3.Row]:
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT
+                id,
+                snapshot_id,
+                asset_name,
+                asset_class,
+                currency,
+                original_value,
+                value_inr
+            FROM snapshot_asset_items
+            WHERE snapshot_id = ?
+            ORDER BY value_inr DESC, id ASC
+            """,
+            (snapshot_id,),
+        ).fetchall()
+
+
+def fetch_snapshot_liability_items(snapshot_id: int) -> list[sqlite3.Row]:
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT
+                id,
+                snapshot_id,
+                liability_name,
+                liability_type,
+                currency,
+                original_outstanding,
+                outstanding_inr
+            FROM snapshot_liability_items
+            WHERE snapshot_id = ?
+            ORDER BY outstanding_inr DESC, id ASC
+            """,
+            (snapshot_id,),
+        ).fetchall()
 
 
 def fetch_category_filters() -> list[sqlite3.Row]:
@@ -426,6 +590,161 @@ def add_asset(
                 notes,
             ),
         )
+
+
+def add_liability(
+    name: str,
+    liability_type: str,
+    currency: str,
+    outstanding_amount: float,
+    interest_rate: float,
+    monthly_emi: float,
+    start_date: str,
+) -> None:
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO liabilities (
+                name,
+                liability_type,
+                currency,
+                outstanding_amount,
+                interest_rate,
+                monthly_emi,
+                start_date
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                liability_type,
+                currency,
+                outstanding_amount,
+                interest_rate,
+                monthly_emi,
+                start_date,
+            ),
+        )
+
+
+def add_net_worth_snapshot(
+    label: str,
+    net_worth_inr: float,
+    assets_total_inr: float,
+    liabilities_total_inr: float,
+    snapshot_asset_items: list[tuple[str, str, str, float, float]] | None = None,
+    snapshot_liability_items: list[tuple[str, str, str, float, float]] | None = None,
+) -> int:
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO net_worth_snapshots (
+                label,
+                net_worth_inr,
+                assets_total_inr,
+                liabilities_total_inr
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (label, net_worth_inr, assets_total_inr, liabilities_total_inr),
+        )
+        snapshot_id = int(cursor.lastrowid)
+
+        if snapshot_asset_items:
+            connection.executemany(
+                """
+                INSERT INTO snapshot_asset_items (
+                    snapshot_id,
+                    asset_name,
+                    asset_class,
+                    currency,
+                    original_value,
+                    value_inr
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (snapshot_id, asset_name, asset_class, currency, original_value, value_inr)
+                    for asset_name, asset_class, currency, original_value, value_inr in snapshot_asset_items
+                ],
+            )
+
+        if snapshot_liability_items:
+            connection.executemany(
+                """
+                INSERT INTO snapshot_liability_items (
+                    snapshot_id,
+                    liability_name,
+                    liability_type,
+                    currency,
+                    original_outstanding,
+                    outstanding_inr
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        snapshot_id,
+                        liability_name,
+                        liability_type,
+                        currency,
+                        original_outstanding,
+                        outstanding_inr,
+                    )
+                    for liability_name, liability_type, currency, original_outstanding, outstanding_inr in snapshot_liability_items
+                ],
+            )
+
+        return snapshot_id
+
+
+def update_liability(
+    liability_id: int,
+    name: str,
+    liability_type: str,
+    currency: str,
+    outstanding_amount: float,
+    interest_rate: float,
+    monthly_emi: float,
+    start_date: str,
+) -> int:
+    with get_connection() as connection:
+        result = connection.execute(
+            """
+            UPDATE liabilities
+            SET name = ?,
+                liability_type = ?,
+                currency = ?,
+                outstanding_amount = ?,
+                interest_rate = ?,
+                monthly_emi = ?,
+                start_date = ?
+            WHERE id = ?
+            """,
+            (
+                name,
+                liability_type,
+                currency,
+                outstanding_amount,
+                interest_rate,
+                monthly_emi,
+                start_date,
+                liability_id,
+            ),
+        )
+        return result.rowcount
+
+
+def delete_liability(liability_id: int) -> int:
+    with get_connection() as connection:
+        result = connection.execute(
+            """
+            DELETE FROM liabilities
+            WHERE id = ?
+            """,
+            (liability_id,),
+        )
+        return result.rowcount
 
 
 def update_assets_class(asset_ids: list[int], class_key: str) -> int:
