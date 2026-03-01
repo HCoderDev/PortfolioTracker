@@ -5,16 +5,16 @@ from pathlib import Path
 
 DB_PATH = Path("data/portfolio.db")
 
-CATEGORY_SEED: list[tuple[str, str, int]] = [
-    ("EQUITY", "Equity", 1),
-    ("DEBT", "Debt", 2),
-    ("GOLD_SILVER", "Gold & Silver", 3),
-    ("OTHER_COMMODITIES", "Other Commodities", 4),
-    ("CASH", "Cash", 5),
-    ("REAL_ESTATE", "Real Estate", 6),
-    ("CRYPTO", "Crypto", 7),
-    ("ALTERNATIVES", "Alternatives", 8),
-    ("INSURANCE", "Insurance", 9),
+CATEGORY_SEED: list[tuple[str, str, int, float]] = [
+    ("EQUITY", "Equity", 1, 50.0),
+    ("DEBT", "Debt", 2, 15.0),
+    ("GOLD_SILVER", "Gold & Silver", 3, 15.0),
+    ("OTHER_COMMODITIES", "Other Commodities", 4, 0.0),
+    ("CASH", "Cash", 5, 15.0),
+    ("REAL_ESTATE", "Real Estate", 6, 0.0),
+    ("CRYPTO", "Crypto", 7, 0.0),
+    ("ALTERNATIVES", "Alternatives", 8, 0.0),
+    ("INSURANCE", "Insurance", 9, 5.0),
 ]
 
 CLASS_SEED: list[tuple[str, str, str, str, int]] = [
@@ -66,10 +66,16 @@ def _create_taxonomy_tables(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS asset_categories (
             category_key TEXT PRIMARY KEY,
             category_name TEXT NOT NULL,
-            sort_order INTEGER NOT NULL
+            sort_order INTEGER NOT NULL,
+            target_percentage REAL DEFAULT 0.0
         )
         """
     )
+    
+    columns = _table_columns(connection, "asset_categories")
+    if "target_percentage" not in columns:
+        connection.execute("ALTER TABLE asset_categories ADD COLUMN target_percentage REAL DEFAULT 0.0")
+        
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS asset_classes (
@@ -87,8 +93,12 @@ def _create_taxonomy_tables(connection: sqlite3.Connection) -> None:
 def _seed_taxonomy(connection: sqlite3.Connection) -> None:
     connection.executemany(
         """
-        INSERT OR REPLACE INTO asset_categories (category_key, category_name, sort_order)
-        VALUES (?, ?, ?)
+        INSERT INTO asset_categories (category_key, category_name, sort_order, target_percentage)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(category_key) DO UPDATE SET 
+            category_name=excluded.category_name, 
+            sort_order=excluded.sort_order,
+            target_percentage=COALESCE(NULLIF(asset_categories.target_percentage, 0), excluded.target_percentage)
         """,
         CATEGORY_SEED,
     )
@@ -402,11 +412,22 @@ def fetch_categories() -> list[sqlite3.Row]:
     with get_connection() as connection:
         return connection.execute(
             """
-            SELECT category_key, category_name, sort_order
+            SELECT category_key, category_name, sort_order, target_percentage
             FROM asset_categories
             ORDER BY sort_order ASC
             """
         ).fetchall()
+
+def update_category_targets(targets: dict[str, float]) -> None:
+    with get_connection() as connection:
+        connection.executemany(
+            """
+            UPDATE asset_categories
+            SET target_percentage = ?
+            WHERE category_key = ?
+            """,
+            [(pct, key) for key, pct in targets.items()]
+        )
 
 
 def fetch_asset_classes() -> list[sqlite3.Row]:

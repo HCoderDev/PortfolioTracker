@@ -35,13 +35,13 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSpacerItem,
     QStackedWidget,
     QStyle,
+    QSlider,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -75,6 +75,7 @@ from db import (
     update_user_profile,
     update_security,
     update_base_currency,
+    update_category_targets,
 )
 
 CURRENCY_SYMBOLS: dict[str, str] = {
@@ -304,6 +305,7 @@ class PortfolioWindow(QMainWindow):
     EDIT_ASSET_PAGE_INDEX = 4
     ESSENTIALS_PAGE_INDEX = 5
     SETTINGS_PAGE_INDEX = 6
+    ALLOCATION_PAGE_INDEX = 7
 
     def __init__(self) -> None:
         super().__init__()
@@ -1050,7 +1052,7 @@ class PortfolioWindow(QMainWindow):
                 button.setObjectName("navItem")
                 button.setProperty("active", item == "Assets")
                 button.setCursor(Qt.PointingHandCursor)
-                if item in {"Assets", "Liabilities", "Net Worth", "Essentials"}:
+                if item in {"Assets", "Liabilities", "Net Worth", "Essentials", "Allocation"}:
                     button.clicked.connect(
                         lambda _checked=False, selected_item=item: self._on_sidebar_navigation(selected_item)
                     )
@@ -1076,6 +1078,7 @@ class PortfolioWindow(QMainWindow):
         self.content_stack.addWidget(self._build_edit_asset_page())
         self.content_stack.addWidget(self._build_essentials_page())
         self.content_stack.addWidget(self._build_settings_page())
+        self.content_stack.addWidget(self._build_allocation_page())
         content_layout.addWidget(self.content_stack, 1)
         return content
 
@@ -2580,6 +2583,572 @@ class PortfolioWindow(QMainWindow):
         layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding))
         return page
 
+    def _build_allocation_page(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; }")
+
+        content = QWidget()
+        content.setStyleSheet("QWidget { background: transparent; }")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setSpacing(24)
+
+        header_layout = QVBoxLayout()
+        header_layout.setSpacing(8)
+        
+        title = QLabel("Allocation")
+        title.setObjectName("pageTitle")
+        header_layout.addWidget(title)
+        
+        subtitle = QLabel("Asset allocation & rebalancing")
+        subtitle.setObjectName("subTitle")
+        header_layout.addWidget(subtitle)
+        
+        layout.addLayout(header_layout)
+        
+        tabs_layout = QHBoxLayout()
+        tabs_layout.setSpacing(16)
+        
+        asset_alloc_btn = QPushButton("Asset Allocation")
+        asset_alloc_btn.setCursor(Qt.PointingHandCursor)
+        asset_alloc_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2b7a52; color: white; border: none; border-radius: 4px; padding: 10px 16px; font-family: "Segoe UI", sans-serif; font-size: 13px; font-weight: 600;
+            }
+        """)
+        
+        monthly_sip_btn = QPushButton("Monthly SIP Plan")
+        monthly_sip_btn.setCursor(Qt.PointingHandCursor)
+        monthly_sip_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent; color: #22211f; border: none; border-radius: 4px; padding: 10px 16px; font-family: "Segoe UI", sans-serif; font-size: 13px; font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #f7f6f2;
+            }
+        """)
+        
+        tabs_layout.addWidget(asset_alloc_btn)
+        tabs_layout.addWidget(monthly_sip_btn)
+        tabs_layout.addStretch()
+        layout.addLayout(tabs_layout)
+        
+        # Target Allocation Box Placeholder
+        target_panel = QFrame()
+        target_panel.setObjectName("targetPanel")
+        target_panel.setStyleSheet("QFrame#targetPanel { background-color: #ffffff; border: 1px solid #d9d8d3; border-radius: 6px; }")
+        target_layout = QVBoxLayout(target_panel)
+        target_layout.setContentsMargins(24, 24, 24, 24)
+        
+        target_header_layout = QHBoxLayout()
+        target_title = QLabel("Target Allocation")
+        target_title.setStyleSheet('font-family: "Segoe UI", sans-serif; font-size: 14px; font-weight: bold; color: #22211f; border: none;')
+        target_header_layout.addWidget(target_title)
+        target_header_layout.addStretch()
+        
+        self.allocation_edit_btn = QPushButton("✎ Edit")
+        self.allocation_edit_btn.setCursor(Qt.PointingHandCursor)
+        self.allocation_edit_btn.setStyleSheet("color: #2b7a52; font-weight: bold; border: none;")
+        self.allocation_edit_btn.clicked.connect(self._toggle_allocation_edit_mode)
+        target_header_layout.addWidget(self.allocation_edit_btn)
+        target_layout.addLayout(target_header_layout)
+        
+        self.allocation_target_content = QVBoxLayout()
+        target_layout.addLayout(self.allocation_target_content)
+        
+        layout.addWidget(target_panel)
+        
+        # Actuals Box Placeholder
+        actuals_panel = QFrame()
+        actuals_panel.setObjectName("actualsPanel")
+        actuals_panel.setStyleSheet("QFrame#actualsPanel { background-color: #ffffff; border: 1px solid #d9d8d3; border-radius: 6px; }")
+        actuals_layout = QVBoxLayout(actuals_panel)
+        actuals_layout.setContentsMargins(24, 24, 24, 24)
+        actuals_title = QLabel("Target vs Actual")
+        actuals_title.setStyleSheet('font-family: "Segoe UI", sans-serif; font-size: 14px; font-weight: bold; color: #22211f; border: none;')
+        actuals_layout.addWidget(actuals_title)
+        
+        self.allocation_actuals_content = QVBoxLayout()
+        actuals_layout.addLayout(self.allocation_actuals_content)
+        
+        layout.addWidget(actuals_panel)
+        
+        layout.addStretch()
+        scroll.setWidget(content)
+        
+        self.allocation_edit_mode = False
+        self._refresh_allocation_view()
+        
+        return scroll
+
+    def _toggle_allocation_edit_mode(self):
+        self.allocation_edit_mode = not getattr(self, "allocation_edit_mode", False)
+        self.allocation_edit_btn.setText("Close" if self.allocation_edit_mode else "✎ Edit")
+        self._refresh_allocation_view()
+
+    def _refresh_allocation_view(self):
+        self._clear_layout(self.allocation_target_content)
+        categories = fetch_categories()
+        
+        # Color scale based on screenshots
+        colors = {
+            "EQUITY": "#24508f", # Blue
+            "DEBT": "#45815a", # Green
+            "GOLD_SILVER": "#ce9027", # Gold
+            "CASH": "#837d74", # Grey
+            "INSURANCE": "#b9707e", # Pinkish
+            "OTHER_COMMODITIES": "#a68257", # Brown
+            "REAL_ESTATE": "#a18a56", # Dark Gold
+            "CRYPTO": "#606af9", # Bright Blue
+            "ALTERNATIVES": "#712f6f" # Purple
+        }
+        
+        from PySide6.QtGui import QPainter, QColor, QFont
+        from PySide6.QtWidgets import QToolTip
+        
+        class TargetStackedBar(QWidget):
+            def __init__(self, data):
+                super().__init__()
+                self.data = data
+                self.setFixedHeight(30)
+                self.setMouseTracking(True)
+                self._hovered_idx = -1
+                
+            def update_data(self, data):
+                self.data = data
+                self.update()
+                
+            def mouseMoveEvent(self, event):
+                total_width = self.rect().width()
+                current_x = 0
+                for i, (key, name, pct, color) in enumerate(self.data):
+                    w = (pct / 100.0) * total_width
+                    if current_x <= event.position().x() <= current_x + w:
+                        if self._hovered_idx != i:
+                            self._hovered_idx = i
+                            QToolTip.showText(event.globalPosition().toPoint(), f"{name}: {pct:.1f}%", self)
+                            self.update()
+                        return
+                    current_x += w
+                if self._hovered_idx != -1:
+                    self._hovered_idx = -1
+                    QToolTip.hideText()
+                    self.update()
+
+            def leaveEvent(self, event):
+                self._hovered_idx = -1
+                QToolTip.hideText()
+                self.update()
+
+            def paintEvent(self, event):
+                painter = QPainter(self)
+                painter.setRenderHint(QPainter.Antialiasing)
+                rect = self.rect()
+                
+                total_width = rect.width()
+                current_x = 0
+                
+                for i, (key, name, pct, color) in enumerate(self.data):
+                    if pct <= 0: continue
+                    w = (pct / 100.0) * total_width
+                    painter.fillRect(int(current_x), 0, int(w), 20, QColor(color))
+                    
+                    # Highlight on hover
+                    if i == self._hovered_idx:
+                        painter.setBrush(QColor(255, 255, 255, 60))
+                        painter.drawRect(int(current_x), 0, int(w), 20)
+                    
+                    # Smart label rendering based on segment width
+                    if w > 60:
+                        painter.setPen(QColor("white"))
+                        painter.setFont(QFont("Segoe UI", 9))
+                        painter.drawText(int(current_x), 0, int(w), 20, Qt.AlignCenter, f"{name} {int(pct)}%")
+                    elif w > 30:
+                        painter.setPen(QColor("white"))
+                        painter.setFont(QFont("Segoe UI", 9))
+                        short_name = name[:3] + "." if len(name) > 3 else name
+                        painter.drawText(int(current_x), 0, int(w), 20, Qt.AlignCenter, short_name)
+                        
+                    current_x += w
+
+        if getattr(self, "allocation_edit_mode", False):
+            # Edit Mode
+            edit_container = QWidget()
+            edit_layout = QVBoxLayout(edit_container)
+            edit_layout.setContentsMargins(0, 0, 0, 0)
+            
+            top_bar_layout = QHBoxLayout()
+            self.edit_stacked_bar = TargetStackedBar([])
+            top_bar_layout.addWidget(self.edit_stacked_bar)
+            
+            self.alloc_sliders = {}
+            self.alloc_inputs = {}
+            total_lbl = QLabel()
+            total_lbl.setFixedWidth(50)
+            total_lbl.setAlignment(Qt.AlignCenter)
+            total_lbl.setStyleSheet("font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; border: none;")
+            top_bar_layout.addWidget(total_lbl)
+            
+            edit_layout.addLayout(top_bar_layout)
+            edit_layout.addSpacing(16)
+            
+            def update_total():
+                total = sum(s.value() for s in self.alloc_sliders.values())
+                total_lbl.setText(f"{total}% ✓" if total == 100 else f"{total}% ⚠")
+                total_lbl.setStyleSheet(f"font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; border: none; color: {'#2b7a52' if total == 100 else '#cc4b38'};")
+                save_btn.setEnabled(total == 100)
+                
+                bar_data = []
+                for cat in categories:
+                    k = cat["category_key"]
+                    if k in self.alloc_sliders:
+                        pct = self.alloc_sliders[k].value()
+                        if pct > 0:
+                            bar_data.append((k, cat["category_name"], pct, colors.get(k, "#CCC")))
+                self.edit_stacked_bar.update_data(bar_data)
+
+            for cat in categories:
+                key = cat["category_key"]
+                name = cat["category_name"]
+                target = int(cat["target_percentage"]) if "target_percentage" in cat.keys() and cat["target_percentage"] is not None else 0
+                
+                row = QHBoxLayout()
+                
+                # Color Box
+                color_box = QLabel()
+                color_box.setFixedSize(12, 12)
+                color_box.setStyleSheet(f"background-color: {colors.get(key, '#CCCCCC')}; border-radius: 2px;")
+                row.addWidget(color_box)
+                
+                # Label
+                lbl = QLabel(name)
+                lbl.setFixedWidth(120)
+                lbl.setStyleSheet("font-family: 'Segoe UI'; font-size: 13px; color: #22211f; border: none;")
+                row.addWidget(lbl)
+                
+                # Slider
+                slider = QSlider(Qt.Horizontal)
+                slider.setRange(0, 100)
+                slider.setValue(target)
+                slider.setStyleSheet(f"""
+                    QSlider::groove:horizontal {{ height: 4px; background: #e1e0db; border-radius: 2px; }}
+                    QSlider::handle:horizontal {{ background: {colors.get(key, '#CCCCCC')}; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }}
+                    QSlider::sub-page:horizontal {{ background: {colors.get(key, '#CCCCCC')}; border-radius: 2px; }}
+                """)
+                row.addWidget(slider)
+                
+                # Value Input
+                val_input = QLineEdit(str(target))
+                val_input.setFixedWidth(40)
+                val_input.setStyleSheet("border: 1px solid #d9d8d3; border-radius: 4px; padding: 4px; text-align: right;")
+                row.addWidget(val_input)
+                
+                pct_lbl = QLabel("%")
+                pct_lbl.setStyleSheet("border: none;")
+                row.addWidget(pct_lbl)
+                
+                # Bindings
+                self.alloc_sliders[key] = slider
+                self.alloc_inputs[key] = val_input
+                
+                def on_slider_change(val, k=key, i=val_input):
+                    i.setText(str(val))
+                    update_total()
+                    
+                def on_input_change(txt, k=key, s=slider):
+                    try:
+                        v = int(txt)
+                        if 0 <= v <= 100:
+                            s.setValue(v)
+                    except:
+                        pass
+                        
+                slider.valueChanged.connect(on_slider_change)
+                val_input.textChanged.connect(on_input_change)
+                
+                edit_layout.addLayout(row)
+                
+            # Footer row for total & actions
+            footer_row = QHBoxLayout()
+            save_btn = QPushButton("Save")
+            save_btn.setObjectName("saveButton")
+            save_btn.setStyleSheet("""
+                QPushButton { background-color: #92bca4; color: white; border: none; border-radius: 4px; padding: 8px 16px; font-weight: 600; }
+                QPushButton:enabled { background-color: #2b7a52; }
+            """)
+            save_btn.setCursor(Qt.PointingHandCursor)
+            
+            def save_targets():
+                targets = {k: float(s.value()) for k, s in self.alloc_sliders.items()}
+                update_category_targets(targets)
+                self._toggle_allocation_edit_mode()
+                
+            save_btn.clicked.connect(save_targets)
+            footer_row.addWidget(save_btn)
+            
+            reset_btn = QPushButton("Reset to Default")
+            reset_btn.setObjectName("secondaryButton")
+            reset_btn.setCursor(Qt.PointingHandCursor)
+            
+            def reset_targets():
+                for s in self.alloc_sliders.values(): s.setValue(0)
+            reset_btn.clicked.connect(reset_targets)
+            footer_row.addWidget(reset_btn)
+            
+            footer_row.addStretch()
+            
+            edit_layout.addSpacing(16)
+            edit_layout.addLayout(footer_row)
+            
+            self.allocation_target_content.addWidget(edit_container)
+            update_total()
+
+        else:
+            # View Mode: Custom Canvas Draw for Stacked Bar
+            bar_data = []
+            desc_text = "Target allocation"
+            for cat in categories:
+                pct = float(cat["target_percentage"]) if "target_percentage" in cat.keys() and cat["target_percentage"] is not None else 0.0
+                if pct > 0:
+                    bar_data.append((cat["category_key"], cat["category_name"], pct, colors.get(cat["category_key"], "#CCC")))
+            
+            view_container = QWidget()
+            vl = QVBoxLayout(view_container)
+            vl.setContentsMargins(0,0,0,0)
+            
+            if not bar_data:
+                desc_text = "No target allocation set. Click Edit to set one."
+            else:
+                stacked_bar = TargetStackedBar(bar_data)
+                vl.addWidget(stacked_bar)
+                
+            desc_lbl = QLabel(desc_text)
+            desc_lbl.setStyleSheet("font-size: 11px; color: #6b6962;")
+            vl.addWidget(desc_lbl)
+            
+            self.allocation_target_content.addWidget(view_container)
+            
+        # Target vs Actual Logic
+        self._clear_layout(self.allocation_actuals_content)
+        
+        assets = fetch_assets()
+        cat_actuals = {}
+        total_actual = 0.0
+        
+        for a in assets:
+            cat = a["category_key"]
+            val = float(a["value"])
+            if cat not in cat_actuals:
+                cat_actuals[cat] = 0.0
+            cat_actuals[cat] += val
+            total_actual += val
+            
+        actuals_data = []
+        for cat in categories:
+            key = cat["category_key"]
+            target_pct = float(cat["target_percentage"]) if "target_percentage" in cat.keys() and cat["target_percentage"] is not None else 0.0
+            actual_val = cat_actuals.get(key, 0.0)
+            actual_pct = (actual_val / total_actual * 100) if total_actual > 0 else 0.0
+            
+            target_val = (target_pct / 100.0) * total_actual
+            diff_val = actual_val - target_val
+            diff_pct = actual_pct - target_pct
+            
+            actuals_data.append({
+                "key": key,
+                "name": cat["category_name"],
+                "color": colors.get(key, "#CCC"),
+                "actual_val": actual_val,
+                "actual_pct": actual_pct,
+                "target_val": target_val,
+                "target_pct": target_pct,
+                "diff_val": diff_val,
+                "diff_pct": diff_pct
+            })
+            
+        # 1. Big Actual Stacked Bar
+        actuals_view = QWidget()
+        actuals_vl = QVBoxLayout(actuals_view)
+        actuals_vl.setContentsMargins(0,0,0,0)
+        actuals_vl.setSpacing(16)
+        
+        bar_data = [(d["key"], d["name"], d["actual_pct"], d["color"]) for d in actuals_data if d["actual_pct"] > 0]
+        
+        if total_actual > 0 and bar_data:
+            from PySide6.QtGui import QPainter, QColor, QFont
+            from PySide6.QtWidgets import QToolTip
+            # Recycle or redefine TargetStackedBar for actuals
+            class ActualStackedBar(QWidget):
+                def __init__(self, data, on_hover_callback=None):
+                    super().__init__()
+                    self.data = data
+                    self.on_hover_callback = on_hover_callback
+                    self.setFixedHeight(30)
+                    self.setMouseTracking(True)
+                    self._hovered_idx = -1
+                    
+                def mouseMoveEvent(self, event):
+                    total_width = self.rect().width()
+                    current_x = 0
+                    for i, (key, name, pct, color) in enumerate(self.data):
+                        w = (pct / 100.0) * total_width
+                        if current_x <= event.position().x() <= current_x + w:
+                            if self._hovered_idx != i:
+                                self._hovered_idx = i
+                                QToolTip.showText(event.globalPosition().toPoint(), f"{name}: {pct:.1f}%", self)
+                                if self.on_hover_callback:
+                                    self.on_hover_callback(key)
+                                self.update()
+                            return
+                        current_x += w
+                    if self._hovered_idx != -1:
+                        self._hovered_idx = -1
+                        QToolTip.hideText()
+                        if self.on_hover_callback:
+                            self.on_hover_callback(None)
+                        self.update()
+
+                def leaveEvent(self, event):
+                    self._hovered_idx = -1
+                    QToolTip.hideText()
+                    if self.on_hover_callback:
+                        self.on_hover_callback(None)
+                    self.update()
+
+                def paintEvent(self, event):
+                    painter = QPainter(self)
+                    painter.setRenderHint(QPainter.Antialiasing)
+                    rect = self.rect()
+                    total_width = rect.width()
+                    current_x = 0
+                    
+                    for i, (key, name, pct, color) in enumerate(self.data):
+                        w = (pct / 100.0) * total_width
+                        
+                        painter.fillRect(int(current_x), 0, int(w), 20, QColor(color))
+                        
+                        # Draw hover highlights
+                        if i == self._hovered_idx:
+                            painter.setBrush(QColor(255, 255, 255, 60))
+                            painter.drawRect(int(current_x), 0, int(w), 20)
+                            
+                        if w > 60:
+                            painter.setPen(QColor("white"))
+                            painter.setFont(QFont("Segoe UI", 9))
+                            painter.drawText(int(current_x), 0, int(w), 20, Qt.AlignCenter, f"{name} {pct:.1f}%")
+                        elif w > 30:
+                            painter.setPen(QColor("white"))
+                            painter.setFont(QFont("Segoe UI", 9))
+                            short_name = name[:3] + "." if len(name) > 3 else name
+                            painter.drawText(int(current_x), 0, int(w), 20, Qt.AlignCenter, short_name)
+                            
+                        current_x += w
+            
+            self._category_rows = {}
+            def handle_bar_hover(key):
+                for k, row_widget in self._category_rows.items():
+                    if k == key:
+                        row_widget.setStyleSheet("QFrame#catRow { background-color: #f7f7f5; border-bottom: 1px solid #f0f0f0; border-radius: 6px; }")
+                    else:
+                        row_widget.setStyleSheet("QFrame#catRow { background-color: transparent; border-bottom: 1px solid #f0f0f0; border-radius: 0px; }")
+                        
+            actuals_vl.addWidget(ActualStackedBar(bar_data, handle_bar_hover))
+        else:
+            empty_lbl = QLabel("No assets to show for actual allocation.")
+            empty_lbl.setStyleSheet("color: #6b6962; font-size: 13px;")
+            actuals_vl.addWidget(empty_lbl)
+            
+        # 2. Category Breakdown Rows
+        
+        class CategoryDiffRow(QFrame):
+            def __init__(self, data):
+                super().__init__()
+                self.setObjectName("catRow")
+                self.setStyleSheet("QFrame#catRow { background-color: transparent; border-bottom: 1px solid #f0f0f0; border-radius: 0px; }")
+                layout = QVBoxLayout(self)
+                layout.setContentsMargins(0, 16, 0, 16)
+                layout.setSpacing(8)
+                
+                header_row = QHBoxLayout()
+                
+                color_box = QLabel()
+                color_box.setFixedSize(10, 10)
+                color_box.setStyleSheet(f"background-color: {data['color']}; border-radius: 2px; border: none;")
+                header_row.addWidget(color_box)
+                
+                name_lbl = QLabel(data['name'])
+                name_lbl.setStyleSheet("font-family: 'Segoe UI'; font-size: 13px; font-weight: bold; border: none;")
+                header_row.addWidget(name_lbl)
+                
+                diff_pct_str = f"+{data['diff_pct']:.1f}%" if data['diff_pct'] >= 0 else f"{data['diff_pct']:.1f}%"
+                diff_lbl = QLabel(diff_pct_str)
+                bg_color = "#e8f3ec" if data['diff_pct'] >= 0 else "#f9eaea"
+                tx_color = "#2b7a52" if data['diff_pct'] >= 0 else "#c23b31"
+                diff_lbl.setStyleSheet(f"background-color: {bg_color}; color: {tx_color}; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: bold; border: none;")
+                header_row.addWidget(diff_lbl)
+                
+                header_row.addStretch()
+                layout.addLayout(header_row)
+                
+                # Visual Bar with Target Marker
+                class ProgressBarWithTarget(QWidget):
+                    def paintEvent(self, event):
+                        from PySide6.QtGui import QPainter, QColor, QPen
+                        painter = QPainter(self)
+                        painter.setRenderHint(QPainter.Antialiasing)
+                        rect = self.rect()
+                        
+                        # Background
+                        painter.fillRect(0, 0, rect.width(), 12, QColor("#f4f3ef"))
+                        
+                        # Fill
+                        fill_w = (data['actual_pct'] / 100.0) * rect.width()
+                        painter.fillRect(0, 0, int(fill_w), 12, QColor(data['color']))
+                        
+                        # Target Marker
+                        target_x = (data['target_pct'] / 100.0) * rect.width()
+                        pen = QPen(QColor("#a9a8a5"))
+                        pen.setWidth(2)
+                        painter.setPen(pen)
+                        painter.drawLine(int(target_x), -2, int(target_x), 14)
+
+                bar = ProgressBarWithTarget()
+                bar.setFixedHeight(16)
+                layout.addWidget(bar)
+                
+                # Details text
+                details_row = QHBoxLayout()
+                curr_txt = f"Current <b>{data['actual_pct']:.1f}%</b> ({format_signed_compact_inr(data['actual_val']).replace('+','')})"
+                tgt_txt = f"Target <b>{data['target_pct']:.0f}%</b> ({format_signed_compact_inr(data['target_val']).replace('+','')})"
+                
+                details_lbl = QLabel(f"{curr_txt}   {tgt_txt}")
+                details_lbl.setStyleSheet("font-size: 12px; color: #6b6962; border: none;")
+                details_row.addWidget(details_lbl)
+                
+                if abs(data['diff_pct']) > 0.1: # Only suggest action if diff is meaningful
+                    action_txt = "Reduce" if data['diff_val'] > 0 else "Add"
+                    action_val = format_signed_compact_inr(abs(data['diff_val'])).replace('+','')
+                    action_lbl = QLabel(f"→ <span style='color: {'#c23b31' if action_txt == 'Reduce' else '#2b7a52'}; font-weight: bold;'>{action_txt} {action_val}</span>")
+                    action_lbl.setStyleSheet("font-size: 12px; border: none;")
+                    details_row.addWidget(action_lbl)
+                
+                details_row.addStretch()
+                layout.addLayout(details_row)
+        
+        if not hasattr(self, "_category_rows"):
+            self._category_rows = {}
+        self._category_rows.clear()
+            
+        for d in actuals_data:
+            if d["actual_val"] > 0 or d["target_pct"] > 0:
+                row = CategoryDiffRow(d)
+                self._category_rows[d["key"]] = row
+                actuals_vl.addWidget(row)
+                
+        self.allocation_actuals_content.addWidget(actuals_view)
+
     def _build_edit_asset_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -3977,6 +4546,8 @@ class PortfolioWindow(QMainWindow):
                 self._show_settings_page()
             else:
                 self._show_essentials_page()
+        elif item_name == "Allocation":
+            self._show_allocation_page()
 
     def _set_net_worth_mode(self, mode: str) -> None:
         if self.net_worth_view_mode == mode:
@@ -4002,6 +4573,14 @@ class PortfolioWindow(QMainWindow):
     def _show_essentials_page(self) -> None:
         self._set_active_nav_item("Essentials")
         self.content_stack.setCurrentIndex(self.ESSENTIALS_PAGE_INDEX)
+
+    def _show_settings_page(self) -> None:
+        self._set_active_nav_item("Essentials")
+        self.content_stack.setCurrentIndex(self.SETTINGS_PAGE_INDEX)
+        
+    def _show_allocation_page(self) -> None:
+        self._set_active_nav_item("Allocation")
+        self.content_stack.setCurrentIndex(self.ALLOCATION_PAGE_INDEX)
 
     def _snapshot_mode_title(self, mode: str) -> str:
         if mode == "ASSETS":
@@ -4270,8 +4849,11 @@ class PortfolioWindow(QMainWindow):
         # Map scene coordinates of closest point back to viewport coordinates
         view_pos = self.timeline_chart_view.mapFromScene(closest_point)
         
-        tooltip_x = view_pos.x() + 15
-        tooltip_y = view_pos.y() - rect.height() - 15
+        # safely handle different Point types
+        vx = view_pos.x()
+        vy = view_pos.y()
+        tooltip_x = vx + 15
+        tooltip_y = vy - rect.height() - 15
         
         if tooltip_x + rect.width() > self.timeline_chart_view.viewport().width():
             tooltip_x = view_pos.x() - rect.width() - 15
