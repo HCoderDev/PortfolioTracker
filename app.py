@@ -5,8 +5,8 @@ import re
 import sys
 import unicodedata
 
-from PySide6.QtCore import QDateTime, QEvent, QItemSelectionModel, QPoint, QSize, QTimer, Qt
-from PySide6.QtCharts import QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
+from PySide6.QtCore import QDateTime, QEvent, QItemSelectionModel, QPoint, QPointF, QSize, QTimer, Qt, QObject
+from PySide6.QtCharts import QCategoryAxis, QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFrame,
+    QGraphicsLineItem,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -54,6 +55,7 @@ from db import (
     add_asset,
     delete_liability,
     delete_assets,
+    delete_snapshot,
     fetch_asset_classes,
     fetch_assets,
     fetch_categories,
@@ -66,7 +68,13 @@ from db import (
     update_asset_details,
     update_liability,
     update_asset_tag,
+    update_asset_tag,
     update_assets_class,
+    fetch_user_settings,
+    update_financial_profile,
+    update_user_profile,
+    update_security,
+    update_base_currency,
 )
 
 CURRENCY_SYMBOLS: dict[str, str] = {
@@ -205,12 +213,97 @@ ADD_CLASS_ICON_MAP: dict[str, str] = {
 }
 
 
+class TooltipFrame(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setStyleSheet(
+            """
+            QFrame {
+                background-color: #ffffff;
+                border: 1px solid #d9d8d3;
+                border-radius: 6px;
+                padding: 6px 10px;
+            }
+            QLabel {
+                border: none;
+                background: transparent;
+                padding: 0px;
+                margin: 0px;
+            }
+            QLabel#tooltipValue {
+                font-family: "Segoe UI";
+                font-size: 15px;
+                font-weight: 700;
+                color: #22211f;
+            }
+            QLabel#tooltipSub {
+                font-family: "Segoe UI";
+                font-size: 11px;
+                color: #6b6962;
+                margin-top: 1px;
+            }
+            QLabel#tooltipChangePositive {
+                font-family: "Segoe UI";
+                font-size: 11px;
+                font-weight: 600;
+                color: #2b7a52;
+                margin-top: 1px;
+            }
+            QLabel#tooltipChangeNegative {
+                font-family: "Segoe UI";
+                font-size: 11px;
+                font-weight: 600;
+                color: #c23b31;
+                margin-top: 1px;
+            }
+            QLabel#tooltipChangeNeutral {
+                font-family: "Segoe UI";
+                font-size: 11px;
+                font-weight: 600;
+                color: #6b6962;
+                margin-top: 1px;
+            }
+            """
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        self.value_label = QLabel()
+        self.value_label.setObjectName("tooltipValue")
+        layout.addWidget(self.value_label)
+        
+        self.date_label = QLabel()
+        self.date_label.setObjectName("tooltipSub")
+        layout.addWidget(self.date_label)
+        
+        self.change_label = QLabel()
+        self.change_label.setObjectName("tooltipChangeNeutral")
+        layout.addWidget(self.change_label)
+
+
+class ChartHoverFilter(QObject):
+    def __init__(self, window):
+        super().__init__()
+        self.window = window
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.MouseMove:
+            self.window._handle_chart_mouse_move(event.pos())
+        elif event.type() == QEvent.Type.Leave:
+            self.window._hide_chart_tooltip()
+        return super().eventFilter(obj, event)
+
+
 class PortfolioWindow(QMainWindow):
     ASSETS_PAGE_INDEX = 0
     LIABILITIES_PAGE_INDEX = 1
     NET_WORTH_PAGE_INDEX = 2
     ADD_ASSET_PAGE_INDEX = 3
     EDIT_ASSET_PAGE_INDEX = 4
+    ESSENTIALS_PAGE_INDEX = 5
+    SETTINGS_PAGE_INDEX = 6
 
     def __init__(self) -> None:
         super().__init__()
@@ -242,6 +335,9 @@ class PortfolioWindow(QMainWindow):
         self.snapshot_assets_cache: dict[int, list[object]] = {}
         self.snapshot_liabilities_cache: dict[int, list[object]] = {}
         self.expanded_snapshot_ids: set[int] = set()
+        self.chart_tooltip: TooltipFrame | None = None
+        self.chart_v_line: QGraphicsLineItem | None = None
+        self.chart_hover_filter = ChartHoverFilter(self)
         self.toast_widget: QFrame | None = None
         self.selected_asset_ids: set[int] = set()
         self.asset_row_by_id: dict[int, int] = {}
@@ -954,7 +1050,7 @@ class PortfolioWindow(QMainWindow):
                 button.setObjectName("navItem")
                 button.setProperty("active", item == "Assets")
                 button.setCursor(Qt.PointingHandCursor)
-                if item in {"Assets", "Liabilities", "Net Worth"}:
+                if item in {"Assets", "Liabilities", "Net Worth", "Essentials"}:
                     button.clicked.connect(
                         lambda _checked=False, selected_item=item: self._on_sidebar_navigation(selected_item)
                     )
@@ -978,6 +1074,8 @@ class PortfolioWindow(QMainWindow):
         self.content_stack.addWidget(self._build_net_worth_page())
         self.content_stack.addWidget(self._build_add_asset_page())
         self.content_stack.addWidget(self._build_edit_asset_page())
+        self.content_stack.addWidget(self._build_essentials_page())
+        self.content_stack.addWidget(self._build_settings_page())
         content_layout.addWidget(self.content_stack, 1)
         return content
 
@@ -1002,6 +1100,828 @@ class PortfolioWindow(QMainWindow):
         menu_button.setCursor(Qt.PointingHandCursor)
         layout.addWidget(menu_button)
         return top
+
+    def _build_essentials_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setSpacing(24)
+
+        title = QLabel("Essentials")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+
+        subtitle = QLabel("Financial health check")
+        subtitle.setObjectName("subTitle")
+        layout.addWidget(subtitle)
+
+        layout.addSpacing(40)
+
+        card_container = QHBoxLayout()
+        card_container.addStretch()
+
+        warning_card = QFrame()
+        warning_card.setStyleSheet(
+            """
+            QFrame {
+                background-color: #fdf4e4;
+                border-radius: 6px;
+                border: 1px solid #f6e6cb;
+            }
+            QLabel {
+                border: none;
+                background: transparent;
+            }
+            QLabel#warningTitle {
+                font-family: "Georgia";
+                font-size: 16px;
+                font-weight: bold;
+                color: #22211f;
+            }
+            QLabel#warningDesc {
+                font-family: "Segoe UI", sans-serif;
+                font-size: 13px;
+                color: #22211f;
+                line-height: 1.4;
+            }
+            QPushButton#profileBtn {
+                background-color: #2b7a52;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 10px 16px;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QPushButton#profileBtn:hover {
+                background-color: #236543;
+            }
+            """
+        )
+        warning_layout = QVBoxLayout(warning_card)
+        warning_layout.setContentsMargins(40, 40, 40, 40)
+        warning_layout.setSpacing(16)
+        warning_layout.setAlignment(Qt.AlignCenter)
+
+        icon_label = QLabel("⚠️")
+        icon_label.setAlignment(Qt.AlignCenter)
+        font = icon_label.font()
+        font.setPointSize(24)
+        icon_label.setFont(font)
+        warning_layout.addWidget(icon_label)
+
+        warning_title = QLabel("Monthly Expense Data Required")
+        warning_title.setObjectName("warningTitle")
+        warning_title.setAlignment(Qt.AlignCenter)
+        warning_layout.addWidget(warning_title)
+
+        warning_desc = QLabel(
+            "To calculate your financial health scores, we need your monthly expense\n"
+            "amount. This helps us evaluate your emergency fund, insurance needs, and\n"
+            "overall preparedness."
+        )
+        warning_desc.setObjectName("warningDesc")
+        warning_desc.setAlignment(Qt.AlignCenter)
+        warning_layout.addWidget(warning_desc)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        setup_btn = QPushButton("Set Up Financial Profile")
+        setup_btn.setObjectName("profileBtn")
+        setup_btn.setCursor(Qt.PointingHandCursor)
+        setup_btn.clicked.connect(self._show_settings_page)
+        btn_layout.addWidget(setup_btn)
+        btn_layout.addStretch()
+        warning_layout.addLayout(btn_layout)
+
+        card_container.addWidget(warning_card)
+        card_container.addStretch()
+        
+        layout.addLayout(card_container)
+        layout.addStretch()
+
+        return page
+
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setSpacing(24)
+
+        header_layout = QVBoxLayout()
+        header_layout.setSpacing(8)
+        title = QLabel("Settings")
+        title.setObjectName("pageTitle")
+        header_layout.addWidget(title)
+        subtitle = QLabel("Account, preferences & privacy")
+        subtitle.setObjectName("subTitle")
+        header_layout.addWidget(subtitle)
+        layout.addLayout(header_layout)
+
+        main_split = QHBoxLayout()
+        main_split.setSpacing(40)
+
+        # Left Sidebar (Nav Rail)
+        sidebar_frame = QFrame()
+        sidebar_frame.setStyleSheet(
+            """
+            QFrame {
+                background-color: #ffffff;
+                border: 1px solid #d9d8d3;
+                border-radius: 6px;
+            }
+            QPushButton {
+                text-align: left;
+                padding: 12px 16px;
+                background: transparent;
+                border: none;
+                border-radius: 4px;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 13px;
+                color: #22211f;
+                margin: 4px 8px;
+            }
+            QPushButton:hover {
+                background-color: #f7f6f2;
+            }
+            QPushButton[active="true"] {
+                background-color: #e8f3ec;
+                color: #2b7a52;
+                font-weight: 600;
+            }
+            """
+        )
+        sidebar_frame.setFixedWidth(220)
+        sidebar_layout = QVBoxLayout(sidebar_frame)
+        sidebar_layout.setContentsMargins(0, 8, 0, 8)
+        sidebar_layout.setSpacing(0)
+
+        nav_items = [
+            "Financial Profile",
+            "Profile",
+            "Security",
+            "Currency & FX"
+        ]
+        
+        self.settings_nav_buttons = {}
+        for idx, item in enumerate(nav_items):
+            btn = QPushButton(item)
+            btn.setCursor(Qt.PointingHandCursor)
+            
+            btn.clicked.connect(lambda _checked=False, i=idx, name=item: self._on_settings_tab_click(name, i))
+                
+            sidebar_layout.addWidget(btn)
+            self.settings_nav_buttons[item] = btn
+            
+        sidebar_layout.addStretch()
+        main_split.addWidget(sidebar_frame)
+
+        # Right Content Area
+        self.settings_stack = QStackedWidget()
+        
+        # Placeholders for now
+        self.settings_stack.addWidget(self._build_settings_financial_profile_tab())
+        self.settings_stack.addWidget(self._build_settings_profile_tab())
+        self.settings_stack.addWidget(self._build_settings_security_tab())
+        self.settings_stack.addWidget(self._build_settings_currency_tab())
+
+        main_split.addWidget(self.settings_stack, 1)
+        layout.addLayout(main_split)
+
+        return page
+
+    def _build_settings_financial_profile_tab(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("settingsPanel")
+        panel.setStyleSheet(
+            """
+            QFrame#settingsPanel {
+                background-color: #ffffff;
+                border: 1px solid #d9d8d3;
+                border-radius: 6px;
+            }
+            QLabel#settingsPanelTitle {
+                font-family: "Segoe UI", sans-serif;
+                font-size: 14px;
+                font-weight: bold;
+                color: #22211f;
+            }
+            QLabel#settingsPanelDesc {
+                font-family: "Segoe UI", sans-serif;
+                font-size: 12px;
+                color: #6b6962;
+                margin-bottom: 20px;
+            }
+            QLabel#fieldLabel {
+                font-family: "Courier New", monospace;
+                font-size: 11px;
+                color: #6b6962;
+            }
+            QLineEdit {
+                border: 1px solid #d9d8d3;
+                border-radius: 4px;
+                padding: 10px 12px;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 13px;
+                background-color: #ffffff;
+                color: #22211f;
+            }
+            QLineEdit::placeholder {
+                color: #a9a8a5;
+            }
+            QPushButton#saveBtn {
+                background-color: #2b7a52;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 10px 24px;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 13px;
+                font-weight: 600;
+                margin-top: 16px;
+            }
+            QPushButton#saveBtn:hover {
+                background-color: #236543;
+            }
+            """
+        )
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(32, 28, 32, 32)
+        layout.setSpacing(10)
+        
+        # Load Existing Settings
+        settings_row = fetch_user_settings()
+        initial_age = str(settings_row["age"] or "") if settings_row else ""
+        initial_income = str(int(settings_row["monthly_income"])) if settings_row and settings_row["monthly_income"] else ""
+        initial_expense = str(int(settings_row["monthly_expense"])) if settings_row and settings_row["monthly_expense"] else ""
+        initial_savings = str(int(settings_row["monthly_savings"])) if settings_row and settings_row["monthly_savings"] else ""
+
+        title = QLabel("Financial Profile")
+        title.setObjectName("settingsPanelTitle")
+        layout.addWidget(title)
+        
+        desc = QLabel("Used for health scores, essentials tracking, and personalised guidance. All fields are optional.")
+        desc.setObjectName("settingsPanelDesc")
+        layout.addWidget(desc)
+        
+        form_grid = QGridLayout()
+        form_grid.setSpacing(16)
+        
+        # Row 1
+        age_label = QLabel("Age")
+        age_label.setObjectName("fieldLabel")
+        form_grid.addWidget(age_label, 0, 0)
+        income_label = QLabel("Monthly Income")
+        income_label.setObjectName("fieldLabel")
+        form_grid.addWidget(income_label, 0, 1)
+        
+        age_input = QLineEdit(initial_age)
+        age_input.setPlaceholderText("Your age")
+        form_grid.addWidget(age_input, 1, 0)
+        
+        income_input = QLineEdit(initial_income)
+        income_input.setPlaceholderText("Monthly income")
+        form_grid.addWidget(income_input, 1, 1)
+
+        # Row 2
+        expense_label = QLabel("Monthly Expense")
+        expense_label.setObjectName("fieldLabel")
+        form_grid.addWidget(expense_label, 2, 0)
+        savings_label = QLabel("Monthly Savings")
+        savings_label.setObjectName("fieldLabel")
+        form_grid.addWidget(savings_label, 2, 1)
+        
+        expense_input = QLineEdit(initial_expense)
+        expense_input.setPlaceholderText("Monthly expense")
+        form_grid.addWidget(expense_input, 3, 0)
+        
+        savings_input = QLineEdit(initial_savings)
+        savings_input.setPlaceholderText("Monthly savings")
+        form_grid.addWidget(savings_input, 3, 1)
+        
+        layout.addLayout(form_grid)
+        
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.setObjectName("saveBtn")
+        save_btn.setCursor(Qt.PointingHandCursor)
+        
+        # Save button states
+        save_btn.setStyleSheet("""
+            QPushButton#saveBtn {
+                background-color: #2b7a52; color: white; border: none; border-radius: 4px; padding: 10px 24px; font-family: "Segoe UI", sans-serif; font-size: 13px; font-weight: 600; margin-top: 16px;
+            }
+            QPushButton#saveBtn:hover {
+                background-color: #236543;
+            }
+            QPushButton#saveBtn:disabled {
+                background-color: #92bca4;
+            }
+        """)
+        save_btn.setEnabled(False)
+
+        saved_lbl = QLabel("Saved!")
+        saved_lbl.setStyleSheet("color: #2b7a52; font-family: 'Segoe UI', sans-serif; font-size: 13px; font-weight: 600; margin-top: 16px; margin-left: 12px;")
+        saved_lbl.hide()
+
+        def on_input_changed(*args, **kwargs):
+            save_btn.setEnabled(True)
+            saved_lbl.hide()
+
+        age_input.textChanged.connect(on_input_changed)
+        income_input.textChanged.connect(on_input_changed)
+        expense_input.textChanged.connect(on_input_changed)
+        savings_input.textChanged.connect(on_input_changed)
+        
+        def save_financial_profile():
+            try:
+                age_val = int(age_input.text().strip()) if age_input.text().strip() else None
+            except: age_val = None
+            try:
+                inc_val = float(income_input.text().strip().replace(',', '')) if income_input.text().strip() else None
+            except: inc_val = None
+            try:
+                exp_val = float(expense_input.text().strip().replace(',', '')) if expense_input.text().strip() else None
+            except: exp_val = None
+            try:
+                sav_val = float(savings_input.text().strip().replace(',', '')) if savings_input.text().strip() else None
+            except: sav_val = None
+            
+            update_financial_profile(age_val, inc_val, exp_val, sav_val)
+            print(f"Saved Financial Profile: Age={age_val}, Income={inc_val}, Expense={exp_val}, Savings={sav_val}")
+            
+            save_btn.setEnabled(False)
+            saved_lbl.show()
+            QTimer.singleShot(3000, saved_lbl.hide)
+            
+        save_btn.clicked.connect(save_financial_profile)
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(saved_lbl)
+        btn_layout.addStretch()
+        
+        layout.addLayout(btn_layout)
+        layout.addStretch()
+        
+        outer_container = QWidget()
+        outer_layout = QVBoxLayout(outer_container)
+        outer_layout.setContentsMargins(0,0,0,0)
+        outer_layout.addWidget(panel)
+        outer_layout.addStretch()
+        
+        return outer_container
+
+    def _build_settings_profile_tab(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("settingsPanel")
+        panel.setStyleSheet(
+            """
+            QFrame#settingsPanel {
+                background-color: #ffffff;
+                border: 1px solid #d9d8d3;
+                border-radius: 6px;
+            }
+            QLabel#settingsPanelTitle {
+                font-family: "Segoe UI", sans-serif;
+                font-size: 14px;
+                font-weight: bold;
+                color: #22211f;
+            }
+            QLabel#fieldLabel {
+                font-family: "Courier New", monospace;
+                font-size: 11px;
+                color: #6b6962;
+            }
+            QLineEdit {
+                border: 1px solid #d9d8d3;
+                border-radius: 4px;
+                padding: 10px 12px;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 13px;
+                background-color: #ffffff;
+                color: #22211f;
+            }
+            QLineEdit::placeholder {
+                color: #a9a8a5;
+            }
+            """
+        )
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(32, 28, 32, 32)
+        layout.setSpacing(10)
+
+        settings_row = fetch_user_settings()
+        initial_name = settings_row["display_name"] if settings_row and settings_row["display_name"] else ""
+        initial_email = settings_row["email"] if settings_row and settings_row["email"] else ""
+
+        title = QLabel("Profile")
+        title.setObjectName("settingsPanelTitle")
+        layout.addWidget(title)
+        layout.addSpacing(16)
+
+        form_grid = QGridLayout()
+        form_grid.setSpacing(16)
+
+        name_label = QLabel("Display Name")
+        name_label.setObjectName("fieldLabel")
+        form_grid.addWidget(name_label, 0, 0)
+        
+        email_label = QLabel("Email")
+        email_label.setObjectName("fieldLabel")
+        form_grid.addWidget(email_label, 0, 1)
+
+        name_input = QLineEdit(initial_name)
+        form_grid.addWidget(name_input, 1, 0)
+
+        email_input = QLineEdit(initial_email)
+        email_input.setPlaceholderText("yourname@example.com")
+        form_grid.addWidget(email_input, 1, 1)
+        
+        email_hint = QLabel("Email cannot be changed")
+        email_hint.setStyleSheet("font-size: 10px; color: #6b6962;")
+        form_grid.addWidget(email_hint, 2, 1)
+        
+        layout.addLayout(form_grid)
+
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.setObjectName("saveBtn")
+        save_btn.setCursor(Qt.PointingHandCursor)
+        save_btn.setStyleSheet("""
+            QPushButton#saveBtn {
+                background-color: #2b7a52; color: white; border: none; border-radius: 4px; padding: 10px 24px; font-family: "Segoe UI", sans-serif; font-size: 13px; font-weight: 600; margin-top: 16px;
+            }
+            QPushButton#saveBtn:hover {
+                background-color: #236543;
+            }
+            QPushButton#saveBtn:disabled {
+                background-color: #92bca4;
+            }
+        """)
+        save_btn.setEnabled(False)
+
+        saved_lbl = QLabel("Saved!")
+        saved_lbl.setStyleSheet("color: #2b7a52; font-family: 'Segoe UI', sans-serif; font-size: 13px; font-weight: 600; margin-top: 16px; margin-left: 12px;")
+        saved_lbl.hide()
+
+        def on_input_changed(*args, **kwargs):
+            save_btn.setEnabled(True)
+            saved_lbl.hide()
+            
+        name_input.textChanged.connect(on_input_changed)
+        email_input.textChanged.connect(on_input_changed)
+        
+        def save_profile():
+            name_val = name_input.text().strip()
+            email_val = email_input.text().strip()
+            update_user_profile(name_val, email_val)
+            print(f"Saved Profile: Name={name_val}, Email={email_val}")
+            save_btn.setEnabled(False)
+            saved_lbl.show()
+            QTimer.singleShot(3000, saved_lbl.hide)
+            
+        save_btn.clicked.connect(save_profile)
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(saved_lbl)
+        btn_layout.addStretch()
+        
+        layout.addLayout(btn_layout)
+        layout.addStretch()
+
+        outer_container = QWidget()
+        outer_layout = QVBoxLayout(outer_container)
+        outer_layout.setContentsMargins(0,0,0,0)
+        outer_layout.addWidget(panel)
+        outer_layout.addStretch()
+        return outer_container
+
+    def _build_settings_security_tab(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        # Set Password Panel
+        pwd_panel = QFrame()
+        pwd_panel.setObjectName("settingsPanel")
+        
+        shared_style = """
+            QFrame#settingsPanel {
+                background-color: #ffffff;
+                border: 1px solid #d9d8d3;
+                border-radius: 6px;
+            }
+            QLabel#settingsPanelTitle {
+                font-family: "Segoe UI", sans-serif;
+                font-size: 14px;
+                font-weight: bold;
+                color: #22211f;
+            }
+            QLabel#settingsPanelDesc {
+                font-family: "Segoe UI", sans-serif;
+                font-size: 12px;
+                color: #6b6962;
+                margin-bottom: 20px;
+            }
+            QLabel#fieldLabel {
+                font-family: "Courier New", monospace;
+                font-size: 11px;
+                color: #6b6962;
+            }
+            QLineEdit {
+                border: 1px solid #d9d8d3;
+                border-radius: 4px;
+                padding: 10px 12px;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 13px;
+                background-color: #ffffff;
+                color: #22211f;
+            }
+            QLineEdit::placeholder {
+                color: #a9a8a5;
+            }
+        """
+        pwd_panel.setStyleSheet(shared_style)
+        pwd_layout = QVBoxLayout(pwd_panel)
+        pwd_layout.setContentsMargins(32, 28, 32, 32)
+        pwd_layout.setSpacing(10)
+
+        pwd_title = QLabel("Set Password")
+        pwd_title.setObjectName("settingsPanelTitle")
+        pwd_layout.addWidget(pwd_title)
+        
+        pwd_desc = QLabel("Set a password so you can also sign in with email and password, in addition to Google.")
+        pwd_desc.setObjectName("settingsPanelDesc")
+        pwd_layout.addWidget(pwd_desc)
+        
+        pwd_form = QVBoxLayout()
+        pwd_form.setSpacing(8)
+        
+        new_pwd_lbl = QLabel("New Password")
+        new_pwd_lbl.setObjectName("fieldLabel")
+        pwd_form.addWidget(new_pwd_lbl)
+        
+        new_pwd_input = QLineEdit()
+        new_pwd_input.setPlaceholderText("Min 8 characters")
+        new_pwd_input.setEchoMode(QLineEdit.Password)
+        new_pwd_input.setFixedWidth(300)
+        pwd_form.addWidget(new_pwd_input)
+        
+        pwd_form.addSpacing(8)
+        
+        conf_pwd_lbl = QLabel("Confirm New Password")
+        conf_pwd_lbl.setObjectName("fieldLabel")
+        pwd_form.addWidget(conf_pwd_lbl)
+        
+        conf_pwd_input = QLineEdit()
+        conf_pwd_input.setPlaceholderText("Re-enter new password")
+        conf_pwd_input.setEchoMode(QLineEdit.Password)
+        conf_pwd_input.setFixedWidth(300)
+        pwd_form.addWidget(conf_pwd_input)
+        
+        pwd_layout.addLayout(pwd_form)
+        pwd_layout.addSpacing(16)
+        
+        pwd_btn_layout = QHBoxLayout()
+        set_pwd_btn = QPushButton("Set Password")
+        set_pwd_btn.setObjectName("saveBtn")
+        set_pwd_btn.setStyleSheet("""
+            QPushButton#saveBtn {
+                background-color: #2b7a52; color: white; border: none; border-radius: 4px; padding: 10px 24px; font-family: "Segoe UI", sans-serif; font-size: 13px; font-weight: 600; margin-top: 16px;
+            }
+            QPushButton#saveBtn:hover {
+                background-color: #236543;
+            }
+            QPushButton#saveBtn:disabled {
+                background-color: #92bca4;
+            }
+        """)
+        set_pwd_btn.setEnabled(False)
+        set_pwd_btn.setCursor(Qt.PointingHandCursor)
+        
+        saved_lbl = QLabel("Saved!")
+        saved_lbl.setStyleSheet("color: #2b7a52; font-family: 'Segoe UI', sans-serif; font-size: 13px; font-weight: 600; margin-top: 16px; margin-left: 12px;")
+        saved_lbl.hide()
+
+        def on_pwd_changed(*args, **kwargs):
+            set_pwd_btn.setEnabled(True)
+            saved_lbl.hide()
+            
+        new_pwd_input.textChanged.connect(on_pwd_changed)
+        conf_pwd_input.textChanged.connect(on_pwd_changed)
+        
+        def save_password():
+            if new_pwd_input.text() == conf_pwd_input.text() and len(new_pwd_input.text()) >= 8:
+                update_security(password_hash=new_pwd_input.text(), app_pin=None)
+                print("Saved new password")
+                new_pwd_input.clear()
+                conf_pwd_input.clear()
+                set_pwd_btn.setEnabled(False)
+                saved_lbl.show()
+                QTimer.singleShot(3000, saved_lbl.hide)
+        
+        set_pwd_btn.clicked.connect(save_password)
+        pwd_btn_layout.addWidget(set_pwd_btn)
+        pwd_btn_layout.addWidget(saved_lbl)
+        pwd_btn_layout.addStretch()
+        pwd_layout.addLayout(pwd_btn_layout)
+
+        # App Lock Panel
+        pin_panel = QFrame()
+        pin_panel.setObjectName("settingsPanel")
+        pin_panel.setStyleSheet(shared_style)
+        pin_layout = QVBoxLayout(pin_panel)
+        pin_layout.setContentsMargins(32, 28, 32, 32)
+        pin_layout.setSpacing(10)
+        
+        pin_header = QHBoxLayout()
+        pin_icon = QLabel("🔒")
+        pin_title = QLabel("App Lock")
+        pin_title.setObjectName("settingsPanelTitle")
+        pin_header.addWidget(pin_icon)
+        pin_header.addWidget(pin_title)
+        pin_header.addStretch()
+        pin_layout.addLayout(pin_header)
+        
+        pin_desc = QLabel('Require a 4-digit PIN to open the app. <span style="color:#d97706;">Only available when using the installed PWA.</span>')
+        pin_desc.setObjectName("settingsPanelDesc")
+        pin_layout.addWidget(pin_desc)
+        
+        pin_btn_layout = QHBoxLayout()
+        set_pin_btn = QPushButton("🔒 Set Up PIN")
+        set_pin_btn.setObjectName("saveBtn")
+        set_pin_btn.setCursor(Qt.PointingHandCursor)
+        pin_btn_layout.addWidget(set_pin_btn)
+        pin_btn_layout.addStretch()
+        pin_layout.addLayout(pin_btn_layout)
+        
+        layout.addWidget(pwd_panel)
+        layout.addWidget(pin_panel)
+        layout.addStretch()
+        return container
+
+    def _build_settings_currency_tab(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("settingsPanel")
+        panel.setStyleSheet(
+            """
+            QFrame#settingsPanel {
+                background-color: #ffffff;
+                border: 1px solid #d9d8d3;
+                border-radius: 6px;
+            }
+            QLabel#settingsPanelTitle {
+                font-family: "Segoe UI", sans-serif;
+                font-size: 14px;
+                font-weight: bold;
+                color: #22211f;
+            }
+            QLabel#fieldLabel {
+                font-family: "Courier New", monospace;
+                font-size: 11px;
+                color: #6b6962;
+            }
+            """
+        )
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(32, 28, 32, 32)
+        layout.setSpacing(10)
+
+        title = QLabel("Currency & FX")
+        title.setObjectName("settingsPanelTitle")
+        layout.addWidget(title)
+        layout.addSpacing(16)
+        
+        settings_row = fetch_user_settings()
+        initial_curr = settings_row["base_currency"] if settings_row and settings_row["base_currency"] else "INR"
+
+        curr_label = QLabel("Base Display Currency")
+        curr_label.setObjectName("fieldLabel")
+        layout.addWidget(curr_label)
+        
+        curr_combo = QComboBox()
+        curr_combo.addItems(["INR (Indian Rupee)", "USD (US Dollar)", "EUR (Euro)", "GBP (British Pound)"])
+        curr_combo.setFixedWidth(300)
+        curr_combo.setStyleSheet("""
+            QComboBox {
+                border: 1px solid #d9d8d3;
+                border-radius: 4px;
+                padding: 10px 12px;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 13px;
+                background-color: #ffffff;
+                color: #22211f;
+            }
+        """)
+        for i in range(curr_combo.count()):
+            if initial_curr in curr_combo.itemText(i):
+                curr_combo.setCurrentIndex(i)
+                break
+        layout.addWidget(curr_combo)
+        
+        curr_hint = QLabel('✨ <span style="color:#d97706;">Upgrade to Pro to change currency</span>')
+        curr_hint.setStyleSheet("font-size: 11px; margin-bottom: 8px;")
+        layout.addWidget(curr_hint)
+
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("Save Currency")
+        save_btn.setObjectName("saveBtn")
+        save_btn.setCursor(Qt.PointingHandCursor)
+        save_btn.setStyleSheet("""
+            QPushButton#saveBtn {
+                background-color: #2b7a52; color: white; border: none; border-radius: 4px; padding: 10px 24px; font-family: "Segoe UI", sans-serif; font-size: 13px; font-weight: 600; margin-top: 16px;
+            }
+            QPushButton#saveBtn:hover {
+                background-color: #236543;
+            }
+            QPushButton#saveBtn:disabled {
+                background-color: #92bca4;
+            }
+        """)
+        save_btn.setEnabled(False)
+
+        saved_lbl = QLabel("Saved!")
+        saved_lbl.setStyleSheet("color: #2b7a52; font-family: 'Segoe UI', sans-serif; font-size: 13px; font-weight: 600; margin-top: 16px; margin-left: 12px;")
+        saved_lbl.hide()
+
+        def on_curr_changed(*args, **kwargs):
+            save_btn.setEnabled(True)
+            saved_lbl.hide()
+            
+        curr_combo.currentIndexChanged.connect(on_curr_changed)
+        
+        def save_currency():
+            curr_code = curr_combo.currentText().split(" ")[0]
+            update_base_currency(curr_code)
+            print(f"Saved Base Currency: {curr_code}")
+            save_btn.setEnabled(False)
+            saved_lbl.show()
+            QTimer.singleShot(3000, saved_lbl.hide)
+            
+        save_btn.clicked.connect(save_currency)
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(saved_lbl)
+        
+        refresh_btn = QPushButton("Force Refresh Rates")
+        refresh_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: 1px solid #d9d8d3;
+                border-radius: 4px;
+                padding: 8px 16px;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 13px;
+                font-weight: 600;
+                color: #22211f;
+                margin-top: 16px;
+            }
+            QPushButton:hover {
+                background-color: #f7f6f2;
+            }
+        """)
+        refresh_btn.setCursor(Qt.PointingHandCursor)
+        btn_layout.addWidget(refresh_btn)
+        btn_layout.addStretch()
+        
+        layout.addLayout(btn_layout)
+        layout.addSpacing(16)
+        
+        success_msg = QLabel("✓ FX rates loaded Last updated: Just now")
+        success_msg.setStyleSheet("""
+            QLabel {
+                background-color: #e8f3ec;
+                color: #2b7a52;
+                padding: 12px;
+                border-radius: 4px;
+                font-size: 12px;
+                border: 1px solid #cce5d6;
+            }
+        """)
+        layout.addWidget(success_msg)
+
+        layout.addStretch()
+
+        outer_container = QWidget()
+        outer_layout = QVBoxLayout(outer_container)
+        outer_layout.setContentsMargins(0,0,0,0)
+        outer_layout.addWidget(panel)
+        outer_layout.addStretch()
+        return outer_container
+
+    def _on_settings_tab_click(self, item_name: str, index: int) -> None:
+        for name, btn in self.settings_nav_buttons.items():
+            is_active = name == item_name
+            btn.setProperty("active", is_active)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        self.settings_stack.setCurrentIndex(index)
+
+    def _show_settings_page(self) -> None:
+        self._set_active_nav_item("Essentials") # Keep Essentials active in main sidebar
+        self.content_stack.setCurrentIndex(self.SETTINGS_PAGE_INDEX)
+        
+        # Default to first tab
+        self._on_settings_tab_click("Financial Profile", 0)
 
     def _build_assets_page(self) -> QWidget:
         panel = QWidget()
@@ -1091,6 +2011,7 @@ class PortfolioWindow(QMainWindow):
         table_layout.setSpacing(0)
 
         self.asset_table = QTableWidget(0, 6)
+        self.asset_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.asset_table.setObjectName("assetTable")
         self.asset_table.setHorizontalHeaderLabels(["", "NAME", "CLASS", "SUB-TYPE", "INVESTED", "VALUE"])
         self.asset_table.verticalHeader().setVisible(False)
@@ -1201,8 +2122,7 @@ class PortfolioWindow(QMainWindow):
 
         add_liability_btn = QPushButton("+ Add Liability")
         add_liability_btn.setObjectName("addAssetButton")
-        add_liability_btn.setCursor(Qt.PointingHandCursor)
-        add_liability_btn.clicked.connect(self._open_add_liability_dialog)
+        add_liability_btn.clicked.connect(lambda: self._open_add_liability_dialog())
         header_row.addWidget(add_liability_btn)
         layout.addLayout(header_row)
 
@@ -1252,6 +2172,7 @@ class PortfolioWindow(QMainWindow):
         table_layout.addWidget(total_card)
 
         self.liabilities_table = QTableWidget(0, 6)
+        self.liabilities_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.liabilities_table.setObjectName("liabilityTable")
         self.liabilities_table.setHorizontalHeaderLabels(
             ["NAME", "TYPE", "OUTSTANDING ↓", "RATE", "MONTHLY EMI", ""]
@@ -1288,7 +2209,20 @@ class PortfolioWindow(QMainWindow):
 
     def _build_net_worth_page(self) -> QWidget:
         panel = QWidget()
-        layout = QVBoxLayout(panel)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(0)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        panel_layout.addWidget(scroll_area)
+
+        scroll_content = QWidget()
+        scroll_area.setWidget(scroll_content)
+
+        layout = QVBoxLayout(scroll_content)
         layout.setContentsMargins(32, 26, 32, 24)
         layout.setSpacing(14)
 
@@ -1349,6 +2283,7 @@ class PortfolioWindow(QMainWindow):
         chart_layout.addWidget(timeline_subtitle)
 
         self.timeline_chart_view = QChartView()
+        self.timeline_chart_view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.timeline_chart_view.setObjectName("timelineChart")
         self.timeline_chart_view.setMinimumHeight(320)
         self.timeline_chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1402,17 +2337,10 @@ class PortfolioWindow(QMainWindow):
         history_hint.setObjectName("subTitle")
         history_layout.addWidget(history_hint)
 
-        self.snapshot_history_scroll = QScrollArea()
-        self.snapshot_history_scroll.setWidgetResizable(True)
-        self.snapshot_history_scroll.setFrameShape(QFrame.NoFrame)
-        self.snapshot_history_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        history_layout.addWidget(self.snapshot_history_scroll)
-
-        snapshot_history_content = QWidget()
-        self.snapshot_history_scroll.setWidget(snapshot_history_content)
-        self.snapshot_entries_layout = QVBoxLayout(snapshot_history_content)
+        self.snapshot_entries_layout = QVBoxLayout()
         self.snapshot_entries_layout.setContentsMargins(0, 0, 0, 0)
         self.snapshot_entries_layout.setSpacing(10)
+        history_layout.addLayout(self.snapshot_entries_layout)
 
         self.take_first_snapshot_button = QPushButton("Take Your First Snapshot")
         self.take_first_snapshot_button.setObjectName("addAssetButton")
@@ -1426,6 +2354,9 @@ class PortfolioWindow(QMainWindow):
 
     def _create_snapshot_line_table(self, headers: list[str]) -> QTableWidget:
         table = QTableWidget(0, len(headers))
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         table.setObjectName("snapshotLineTable")
         table.setHorizontalHeaderLabels(headers)
         table.verticalHeader().setVisible(False)
@@ -1441,7 +2372,7 @@ class PortfolioWindow(QMainWindow):
         row_count = table.rowCount()
         header_height = table.horizontalHeader().height() or 32
         total_height = header_height + (row_count * 28) + 4
-        bounded_height = max(72, min(280, total_height))
+        bounded_height = max(72, total_height)
         table.setMinimumHeight(bounded_height)
         table.setMaximumHeight(bounded_height)
 
@@ -1829,6 +2760,7 @@ class PortfolioWindow(QMainWindow):
 
     def _make_chip(self, text: str, active: bool = False) -> QPushButton:
         chip = QPushButton(text)
+        chip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         chip.setObjectName("chip")
         chip.setProperty("active", active)
         chip.setCursor(Qt.PointingHandCursor)
@@ -3032,6 +3964,19 @@ class PortfolioWindow(QMainWindow):
             self._show_liabilities_page()
         elif item_name == "Net Worth":
             self._show_net_worth_page()
+        elif item_name == "Essentials":
+            settings = fetch_user_settings()
+            has_data = False
+            if settings:
+                if (settings["age"] or settings["monthly_income"] or 
+                    settings["monthly_expense"] or settings["monthly_savings"] or 
+                    settings["display_name"] or settings["email"]):
+                    has_data = True
+
+            if has_data:
+                self._show_settings_page()
+            else:
+                self._show_essentials_page()
 
     def _set_net_worth_mode(self, mode: str) -> None:
         if self.net_worth_view_mode == mode:
@@ -3053,6 +3998,10 @@ class PortfolioWindow(QMainWindow):
             button.setProperty("active", key == self.net_worth_view_mode)
             button.style().unpolish(button)
             button.style().polish(button)
+
+    def _show_essentials_page(self) -> None:
+        self._set_active_nav_item("Essentials")
+        self.content_stack.setCurrentIndex(self.ESSENTIALS_PAGE_INDEX)
 
     def _snapshot_mode_title(self, mode: str) -> str:
         if mode == "ASSETS":
@@ -3157,25 +4106,190 @@ class PortfolioWindow(QMainWindow):
         chart.addAxis(axis_x, Qt.AlignBottom)
         line_series.attachAxis(axis_x)
 
-        axis_y = QValueAxis()
+        axis_y = QCategoryAxis()
+        axis_y.setLabelsPosition(QCategoryAxis.AxisLabelsPositionOnValue)
         min_y = min(y_values)
-        max_y = max(y_values)
-        if min_y == max_y:
-            spread = max(abs(max_y), 1.0)
-            min_y -= spread * 0.25
-            max_y += spread * 0.25
+        max_y_actual = max(y_values)
+        
+        if max_y_actual > 0:
+            max_y = max_y_actual * 1.2
+        elif max_y_actual < 0:
+            max_y = max_y_actual * 0.8
         else:
-            pad = (max_y - min_y) * 0.2
+            max_y = 1.0
+
+        if min_y == max_y_actual:
+            spread = max(abs(max_y_actual), 1.0)
+            min_y -= spread * 0.25
+            max_y = max_y_actual + spread * 0.25
+        else:
+            pad = (max_y - min_y) * 0.05
             min_y -= pad
-            max_y += pad
+            
         if min_y > 0:
             min_y = 0
-        axis_y.setRange(min_y, max_y)
-        axis_y.setTickCount(5)
-        axis_y.setLabelFormat("%.0f")
+
+        axis_y.setMin(min_y)
+        axis_y.setMax(max_y)
+
+        # Generate 5 evenly spaced ticks
+        tick_count = 5
+        seen_labels = {}
+        for i in range(tick_count):
+            val = min_y + (max_y - min_y) * (i / (tick_count - 1))
+            label = format_compact_inr(val)
+            # Ensure unique labels since QCategoryAxis behaves like a dictionary keys
+            if label in seen_labels:
+                seen_labels[label] += 1
+                label = label + ("\u200b" * seen_labels[label])
+            else:
+                seen_labels[label] = 0
+            axis_y.append(label, val)
+
         axis_y.setLabelsColor(QColor("#5b5953"))
         chart.addAxis(axis_y, Qt.AlignLeft)
         line_series.attachAxis(axis_y)
+
+        # Setup mouse tracking overlay
+        self.timeline_chart_view.viewport().setMouseTracking(True)
+        self.timeline_chart_view.viewport().removeEventFilter(self.chart_hover_filter)
+        self.timeline_chart_view.viewport().installEventFilter(self.chart_hover_filter)
+
+        # Setup custom tooltip as overlay widget
+        if self.chart_tooltip is None:
+            self.chart_tooltip = TooltipFrame(self.timeline_chart_view)
+            self.chart_tooltip.hide()
+
+        # Add vertical line
+        if self.chart_v_line is None:
+            self.chart_v_line = QGraphicsLineItem(chart.plotArea().topLeft().x(), chart.plotArea().top(), chart.plotArea().topLeft().x(), chart.plotArea().bottom())
+            line_pen = QPen(QColor("#a9a8a5"))
+            line_pen.setWidth(1)
+            line_pen.setStyle(Qt.DashLine)
+            self.chart_v_line.setPen(line_pen)
+            self.chart_v_line.setZValue(999)
+            scene = self.timeline_chart_view.scene()
+            if scene:
+                scene.addItem(self.chart_v_line)
+        self.chart_v_line.hide()
+
+        # Add single scatter point for highlighting on hover
+        from PySide6.QtCharts import QScatterSeries
+        self.hover_point_series = QScatterSeries()
+        self.hover_point_series.setMarkerShape(QScatterSeries.MarkerShapeCircle)
+        self.hover_point_series.setMarkerSize(12)
+        hover_pen = QPen(QColor("#2b7a52"))
+        hover_pen.setWidth(3)
+        self.hover_point_series.setPen(hover_pen)
+        self.hover_point_series.setBrush(QColor("white"))
+        self.hover_point_series.setUseOpenGL(False)
+        chart.addSeries(self.hover_point_series)
+        self.hover_point_series.attachAxis(axis_x)
+        self.hover_point_series.attachAxis(axis_y)
+
+
+    def _handle_chart_mouse_move(self, pos: QPoint) -> None:
+        if not hasattr(self, "chart_tooltip") or self.chart_tooltip is None: return
+        chart = self.timeline_chart_view.chart()
+        if not chart: return
+            
+        scene_pos = self.timeline_chart_view.mapToScene(pos)
+        chart_val = chart.mapToValue(scene_pos)
+        x_target = chart_val.x()
+        
+        snapshots_asc = list(reversed(self.net_worth_snapshots))
+        if not snapshots_asc: return
+
+        # Find closest snapshot
+        closest_idx = 0
+        min_dist = float('inf')
+        for i, snapshot in enumerate(snapshots_asc):
+            dt = self._parse_snapshot_datetime(snapshot)
+            x_val = float(QDateTime.fromSecsSinceEpoch(int(dt.timestamp())).toMSecsSinceEpoch())
+            dist = abs(x_val - x_target)
+            if dist < min_dist:
+                min_dist = dist
+                closest_idx = i
+
+        snapshot = snapshots_asc[closest_idx]
+        dt = self._parse_snapshot_datetime(snapshot)
+        x_val = float(QDateTime.fromSecsSinceEpoch(int(dt.timestamp())).toMSecsSinceEpoch())
+        y_val = self._snapshot_metric_value(snapshot, self.net_worth_view_mode)
+        
+        closest_point = chart.mapToPosition(QPointF(x_val, y_val))
+        
+        # Only snap if the mouse is close in screen X
+        dist_screen = abs(scene_pos.x() - closest_point.x())
+        if dist_screen > 80:
+            self._hide_chart_tooltip()
+            return
+            
+        # Update hover dot
+        self.hover_point_series.clear()
+        self.hover_point_series.append(x_val, y_val)
+        
+        # Update vertical line
+        plot_area = chart.plotArea()
+        self.chart_v_line.setLine(closest_point.x(), plot_area.top(), closest_point.x(), plot_area.bottom())
+        if self.chart_v_line.scene() != self.timeline_chart_view.scene():
+             if self.chart_v_line.scene():
+                 self.chart_v_line.scene().removeItem(self.chart_v_line)
+             self.timeline_chart_view.scene().addItem(self.chart_v_line)
+        self.chart_v_line.show()
+        
+        # Update tooltip content
+        self.chart_tooltip.value_label.setText(format_currency(y_val, "INR"))
+        self.chart_tooltip.date_label.setText(dt.strftime("%d %b %Y"))
+        
+        if closest_idx > 0:
+            prev_snapshot = snapshots_asc[closest_idx - 1]
+            prev_value = self._snapshot_metric_value(prev_snapshot, self.net_worth_view_mode)
+            delta = y_val - prev_value
+            pct = (delta / prev_value * 100) if abs(prev_value) > 0.0001 else 0.0
+            
+            if delta > 0:
+                self.chart_tooltip.change_label.setText(f"▲ {format_signed_compact_inr(delta)} (+{abs(pct):.1f}%)")
+                self.chart_tooltip.change_label.setObjectName("tooltipChangePositive")
+            elif delta < 0:
+                self.chart_tooltip.change_label.setText(f"▼ {format_signed_compact_inr(delta)} (-{abs(pct):.1f}%)")
+                self.chart_tooltip.change_label.setObjectName("tooltipChangeNegative")
+            else:
+                self.chart_tooltip.change_label.setText(f"▲ ₹0 (+0.0%)")
+                self.chart_tooltip.change_label.setObjectName("tooltipChangePositive")
+        else:
+            self.chart_tooltip.change_label.setText("baseline")
+            self.chart_tooltip.change_label.setObjectName("tooltipChangeNeutral")
+            
+        self.chart_tooltip.change_label.style().unpolish(self.chart_tooltip.change_label)
+        self.chart_tooltip.change_label.style().polish(self.chart_tooltip.change_label)
+
+        # Position tooltip
+        self.chart_tooltip.adjustSize()
+        rect = self.chart_tooltip.geometry()
+        
+        # Map scene coordinates of closest point back to viewport coordinates
+        view_pos = self.timeline_chart_view.mapFromScene(closest_point)
+        
+        tooltip_x = view_pos.x() + 15
+        tooltip_y = view_pos.y() - rect.height() - 15
+        
+        if tooltip_x + rect.width() > self.timeline_chart_view.viewport().width():
+            tooltip_x = view_pos.x() - rect.width() - 15
+            
+        if tooltip_y < 0:
+            tooltip_y = 10
+            
+        self.chart_tooltip.move(tooltip_x, tooltip_y)
+        self.chart_tooltip.show()
+
+    def _hide_chart_tooltip(self):
+        if hasattr(self, "chart_tooltip") and self.chart_tooltip:
+            self.chart_tooltip.hide()
+        if hasattr(self, "chart_v_line") and self.chart_v_line:
+            self.chart_v_line.hide()
+        if hasattr(self, "hover_point_series") and self.hover_point_series:
+            self.hover_point_series.clear()
+
 
     def _set_metric_card_value(self, value_label: QLabel, meta_label: QLabel, value: float, meta_text: str) -> None:
         value_label.setText(format_signed_compact_inr(value))
@@ -3258,21 +4372,51 @@ class PortfolioWindow(QMainWindow):
         if not hasattr(self, "snapshot_entries_layout"):
             return
 
-        self._clear_layout(self.snapshot_entries_layout)
+        # Instead of deleting all widgets, we will hide excess ones and reuse existing ones.
+        # This prevents macOS from losing window focus when switching tabs in full screen.
+        layout = self.snapshot_entries_layout
+        
+        # Remove the stretching spacer at the end before we add/update widgets
+        for i in range(layout.count() - 1, -1, -1):
+            item = layout.itemAt(i)
+            if item.spacerItem():
+                layout.removeItem(item)
 
         if not snapshots_desc:
-            empty_text = QLabel("No snapshots yet. Take your first snapshot to start history.")
-            empty_text.setObjectName("subTitle")
-            self.snapshot_entries_layout.addWidget(empty_text)
-            self.snapshot_entries_layout.addSpacerItem(
-                QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding)
-            )
+            # Hide all existing cards
+            for i in range(layout.count()):
+                widget = layout.itemAt(i).widget()
+                if widget:
+                    widget.hide()
+            
+            # Show or add empty text
+            empty_text_found = False
+            for i in range(layout.count()):
+                widget = layout.itemAt(i).widget()
+                if isinstance(widget, QLabel) and widget.objectName() == "subTitle":
+                    widget.show()
+                    empty_text_found = True
+                    break
+            
+            if not empty_text_found:
+                empty_text = QLabel("No snapshots yet. Take your first snapshot to start history.")
+                empty_text.setObjectName("subTitle")
+                layout.addWidget(empty_text)
+                
+            layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding))
             return
 
         valid_ids = {int(snapshot["id"]) for snapshot in snapshots_desc}
         self.expanded_snapshot_ids = {snapshot_id for snapshot_id in self.expanded_snapshot_ids if snapshot_id in valid_ids}
-        if not self.expanded_snapshot_ids:
-            self.expanded_snapshot_ids = {int(snapshots_desc[0]["id"])}
+
+        # Find all existing cards
+        existing_cards = []
+        for i in range(layout.count()):
+            widget = layout.itemAt(i).widget()
+            if isinstance(widget, QFrame) and widget.objectName() == "snapshotEntryCard":
+                existing_cards.append(widget)
+            elif isinstance(widget, QLabel) and widget.objectName() == "subTitle":
+                widget.hide()
 
         for row_idx, snapshot in enumerate(snapshots_desc):
             snapshot_id = int(snapshot["id"])
@@ -3289,130 +4433,207 @@ class PortfolioWindow(QMainWindow):
                 delta = value - previous_value
                 pct = (delta / previous_value * 100) if abs(previous_value) > 0.0001 else 0.0
 
-            card = QFrame()
-            card.setObjectName("snapshotEntryCard")
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(0, 0, 0, 0)
-            card_layout.setSpacing(0)
+            if row_idx < len(existing_cards):
+                card = existing_cards[row_idx]
+                card.show()
+                # Clear the card's old contents and recreate to ensure correct data
+                # Recreating inner contents is lighter and less likely to drop top-level window focus
+                # than deleting the main cards themselves.
+                QTimer.singleShot(0, lambda c=card, s_id=snapshot_id, val=value, dt=snapshot_dt, lbl=label_text, hp=has_previous, d=delta, p=pct, r=row_idx, sd=snapshots_desc: self._rebuild_card_contents(c, s_id, val, dt, lbl, hp, d, p, r, sd))
+            else:
+                card = QFrame()
+                card.setObjectName("snapshotEntryCard")
+                card_layout = QVBoxLayout(card)
+                card_layout.setContentsMargins(0, 0, 0, 0)
+                card_layout.setSpacing(0)
+                layout.addWidget(card)
+                self._rebuild_card_contents(card, snapshot_id, value, snapshot_dt, label_text, has_previous, delta, pct, row_idx, snapshots_desc)
 
-            header = QFrame()
-            header.setObjectName("snapshotEntryHeader")
-            header_layout = QHBoxLayout(header)
-            header_layout.setContentsMargins(12, 10, 12, 10)
-            header_layout.setSpacing(10)
+        # Hide excess cards
+        for i in range(len(snapshots_desc), len(existing_cards)):
+            existing_cards[i].hide()
 
-            toggle_button = QToolButton()
-            toggle_button.setObjectName("snapshotToggle")
-            toggle_button.setArrowType(Qt.DownArrow if snapshot_id in self.expanded_snapshot_ids else Qt.RightArrow)
-            toggle_button.setCursor(Qt.PointingHandCursor)
-            toggle_button.clicked.connect(
-                lambda _checked=False, selected_snapshot_id=snapshot_id: self._toggle_snapshot_entry(selected_snapshot_id)
-            )
-            header_layout.addWidget(toggle_button)
+        layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding))
 
-            date_label = QLabel(snapshot_dt.strftime("%d %b %Y"))
-            date_label.setObjectName("snapshotEntryDate")
-            header_layout.addWidget(date_label)
-
-            label_label = QLabel(label_text)
-            label_label.setObjectName("snapshotEntryLabel")
-            header_layout.addWidget(label_label)
-
-            header_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
-
-            value_label = QLabel(format_currency(value, "INR"))
-            value_label.setObjectName("snapshotEntryValue")
-            header_layout.addWidget(value_label)
-
+    def _rebuild_card_contents(self, card: QFrame, snapshot_id: int, value: float, snapshot_dt: datetime, label_text: str, has_previous: bool, delta: float, pct: float, row_idx: int, snapshots_desc: list[object]) -> None:
+        if getattr(card, "snapshot_id", None) == snapshot_id:
+            card.value_label.setText(format_currency(value, "INR"))
+            is_expanded = snapshot_id in self.expanded_snapshot_ids
+            card.toggle_button.setArrowType(Qt.DownArrow if is_expanded else Qt.RightArrow)
+            card.details.setVisible(is_expanded)
+            
             if has_previous:
                 direction = "up" if delta >= 0 else "down"
-                summary_label = QLabel(f"{format_signed_compact_inr(delta)}, {abs(pct):.1f}% {direction}")
-                summary_label.setObjectName("snapshotEntryChangePositive" if delta >= 0 else "snapshotEntryChangeNegative")
+                card.summary_label.setText(f"{format_signed_compact_inr(delta)}, {abs(pct):.1f}% {direction}")
+                card.summary_label.setObjectName("snapshotEntryChangePositive" if delta >= 0 else "snapshotEntryChangeNegative")
             else:
-                summary_label = QLabel("baseline")
-                summary_label.setObjectName("snapshotEntryBaseline")
-            header_layout.addWidget(summary_label)
-            card_layout.addWidget(header)
-
-            details = QFrame()
-            details.setObjectName("snapshotEntryDetails")
-            details_layout = QVBoxLayout(details)
-            details_layout.setContentsMargins(12, 10, 12, 12)
-            details_layout.setSpacing(8)
+                card.summary_label.setText("baseline")
+                card.summary_label.setObjectName("snapshotEntryBaseline")
+            card.summary_label.style().unpolish(card.summary_label)
+            card.summary_label.style().polish(card.summary_label)
 
             if has_previous:
                 previous_snapshot = snapshots_desc[row_idx + 1]
+                snapshot = snapshots_desc[row_idx]
                 current_assets = float(snapshot["assets_total_inr"] or 0)
                 previous_assets = float(previous_snapshot["assets_total_inr"] or 0)
                 current_liabilities = float(snapshot["liabilities_total_inr"] or 0)
                 previous_liabilities = float(previous_snapshot["liabilities_total_inr"] or 0)
-                summary = QLabel(
+                card.details_summary.setText(
                     "What changed: Net worth "
                     f"{format_signed_compact_inr(delta)} "
                     f"(Assets {format_signed_compact_inr(current_assets - previous_assets)}, "
                     f"Liabilities {format_signed_compact_inr(current_liabilities - previous_liabilities)})"
                 )
             else:
-                summary = QLabel("What changed: baseline snapshot")
-            summary.setObjectName("snapshotChangesText")
-            summary.setWordWrap(True)
-            details_layout.addWidget(summary)
+                card.details_summary.setText("What changed: baseline snapshot")
+            return
 
-            asset_items = self._get_snapshot_asset_items(snapshot_id)
-            assets_title = QLabel(f"ASSETS ({len(asset_items)})")
-            assets_title.setObjectName("snapshotSectionTitle")
-            details_layout.addWidget(assets_title)
+        card.snapshot_id = snapshot_id
+        
+        card_layout = card.layout()
+        if card_layout is None:
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(0, 0, 0, 0)
+            card_layout.setSpacing(0)
+            
+        # Clear out old card contents (only happens when shifting actual snapshot data)
+        while card_layout.count():
+            item = card_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
-            assets_table = self._create_snapshot_line_table(["Name", "Class", "Original", "In ₹ INR"])
-            assets_table.setRowCount(len(asset_items))
-            for asset_row, item in enumerate(asset_items):
-                assets_table.setItem(asset_row, 0, QTableWidgetItem(item["asset_name"]))
-                assets_table.setItem(asset_row, 1, QTableWidgetItem(item["asset_class"]))
-                original_item = QTableWidgetItem(
-                    format_currency(float(item["original_value"] or 0), normalize_currency(item["currency"]))
-                )
-                original_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                assets_table.setItem(asset_row, 2, original_item)
-                inr_item = QTableWidgetItem(format_currency(float(item["value_inr"] or 0), "INR"))
-                inr_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                assets_table.setItem(asset_row, 3, inr_item)
-                assets_table.setRowHeight(asset_row, 28)
-            self._fit_snapshot_table_height(assets_table)
-            details_layout.addWidget(assets_table)
+        header = QFrame()
+        header.setObjectName("snapshotEntryHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(12, 10, 12, 10)
+        header_layout.setSpacing(10)
 
-            liability_items = self._get_snapshot_liability_items(snapshot_id)
-            liabilities_title = QLabel(f"LIABILITIES ({len(liability_items)})")
-            liabilities_title.setObjectName("snapshotSectionTitle")
-            details_layout.addWidget(liabilities_title)
-
-            liabilities_table = self._create_snapshot_line_table(["Name", "Type", "Original", "In ₹ INR"])
-            liabilities_table.setRowCount(len(liability_items))
-            for liability_row, item in enumerate(liability_items):
-                liabilities_table.setItem(liability_row, 0, QTableWidgetItem(item["liability_name"]))
-                liabilities_table.setItem(liability_row, 1, QTableWidgetItem(item["liability_type"]))
-                original_item = QTableWidgetItem(
-                    format_currency(
-                        float(item["original_outstanding"] or 0),
-                        normalize_currency(item["currency"]),
-                    )
-                )
-                original_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                liabilities_table.setItem(liability_row, 2, original_item)
-                inr_item = QTableWidgetItem(format_currency(float(item["outstanding_inr"] or 0), "INR"))
-                inr_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                inr_item.setForeground(QColor("#c23b31"))
-                liabilities_table.setItem(liability_row, 3, inr_item)
-                liabilities_table.setRowHeight(liability_row, 28)
-            self._fit_snapshot_table_height(liabilities_table)
-            details_layout.addWidget(liabilities_table)
-
-            details.setVisible(snapshot_id in self.expanded_snapshot_ids)
-            card_layout.addWidget(details)
-            self.snapshot_entries_layout.addWidget(card)
-
-        self.snapshot_entries_layout.addSpacerItem(
-            QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding)
+        toggle_button = QToolButton()
+        toggle_button.setObjectName("snapshotToggle")
+        toggle_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        toggle_button.setArrowType(Qt.DownArrow if snapshot_id in self.expanded_snapshot_ids else Qt.RightArrow)
+        toggle_button.setCursor(Qt.PointingHandCursor)
+        toggle_button.clicked.connect(
+            lambda _checked=False, selected_snapshot_id=snapshot_id: self._toggle_snapshot_entry(selected_snapshot_id)
         )
+        header_layout.addWidget(toggle_button)
+        card.toggle_button = toggle_button
+
+        date_label = QLabel(snapshot_dt.strftime("%d %b %Y"))
+        date_label.setObjectName("snapshotEntryDate")
+        header_layout.addWidget(date_label)
+
+        label_label = QLabel(label_text)
+        label_label.setObjectName("snapshotEntryLabel")
+        header_layout.addWidget(label_label)
+
+        header_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
+
+        value_label = QLabel(format_currency(value, "INR"))
+        value_label.setObjectName("snapshotEntryValue")
+        header_layout.addWidget(value_label)
+        card.value_label = value_label
+
+        if has_previous:
+            direction = "up" if delta >= 0 else "down"
+            summary_label = QLabel(f"{format_signed_compact_inr(delta)}, {abs(pct):.1f}% {direction}")
+            summary_label.setObjectName("snapshotEntryChangePositive" if delta >= 0 else "snapshotEntryChangeNegative")
+        else:
+            summary_label = QLabel("baseline")
+            summary_label.setObjectName("snapshotEntryBaseline")
+        header_layout.addWidget(summary_label)
+        card.summary_label = summary_label
+
+        delete_button = QToolButton()
+        delete_button.setIcon(self.row_action_icons.get("delete", QIcon()))
+        delete_button.setToolTip(f"Delete '{label_text}'")
+        delete_button.setCursor(Qt.PointingHandCursor)
+        delete_button.setObjectName("rowActionBtn")
+        delete_button.clicked.connect(lambda _checked=False, s_id=snapshot_id, name=label_text: self._delete_snapshot(s_id, name))
+        header_layout.addWidget(delete_button)
+        card.delete_button = delete_button
+
+        card_layout.addWidget(header)
+
+        details = QFrame()
+        details.setObjectName("snapshotEntryDetails")
+        details_layout = QVBoxLayout(details)
+        details_layout.setContentsMargins(12, 10, 12, 12)
+        details_layout.setSpacing(8)
+
+        if has_previous:
+            previous_snapshot = snapshots_desc[row_idx + 1]
+            snapshot = snapshots_desc[row_idx]
+            current_assets = float(snapshot["assets_total_inr"] or 0)
+            previous_assets = float(previous_snapshot["assets_total_inr"] or 0)
+            current_liabilities = float(snapshot["liabilities_total_inr"] or 0)
+            previous_liabilities = float(previous_snapshot["liabilities_total_inr"] or 0)
+            summary = QLabel(
+                "What changed: Net worth "
+                f"{format_signed_compact_inr(delta)} "
+                f"(Assets {format_signed_compact_inr(current_assets - previous_assets)}, "
+                f"Liabilities {format_signed_compact_inr(current_liabilities - previous_liabilities)})"
+            )
+        else:
+            summary = QLabel("What changed: baseline snapshot")
+        summary.setObjectName("snapshotChangesText")
+        summary.setWordWrap(True)
+        details_layout.addWidget(summary)
+        card.details_summary = summary
+
+
+        asset_items = self._get_snapshot_asset_items(snapshot_id)
+        assets_title = QLabel(f"ASSETS ({len(asset_items)})")
+        assets_title.setObjectName("snapshotSectionTitle")
+        details_layout.addWidget(assets_title)
+
+        assets_table = self._create_snapshot_line_table(["Name", "Class", "Original", "In ₹ INR"])
+        assets_table.setRowCount(len(asset_items))
+        for asset_row, item in enumerate(asset_items):
+            assets_table.setItem(asset_row, 0, QTableWidgetItem(item["asset_name"]))
+            assets_table.setItem(asset_row, 1, QTableWidgetItem(item["asset_class"]))
+            original_item = QTableWidgetItem(
+                format_currency(float(item["original_value"] or 0), normalize_currency(item["currency"]))
+            )
+            original_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            assets_table.setItem(asset_row, 2, original_item)
+            inr_item = QTableWidgetItem(format_currency(float(item["value_inr"] or 0), "INR"))
+            inr_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            assets_table.setItem(asset_row, 3, inr_item)
+            assets_table.setRowHeight(asset_row, 28)
+        self._fit_snapshot_table_height(assets_table)
+        details_layout.addWidget(assets_table)
+
+        liability_items = self._get_snapshot_liability_items(snapshot_id)
+        liabilities_title = QLabel(f"LIABILITIES ({len(liability_items)})")
+        liabilities_title.setObjectName("snapshotSectionTitle")
+        details_layout.addWidget(liabilities_title)
+
+        liabilities_table = self._create_snapshot_line_table(["Name", "Type", "Original", "In ₹ INR"])
+        liabilities_table.setRowCount(len(liability_items))
+        for liability_row, item in enumerate(liability_items):
+            liabilities_table.setItem(liability_row, 0, QTableWidgetItem(item["liability_name"]))
+            liabilities_table.setItem(liability_row, 1, QTableWidgetItem(item["liability_type"]))
+            original_item = QTableWidgetItem(
+                format_currency(
+                    float(item["original_outstanding"] or 0),
+                    normalize_currency(item["currency"]),
+                )
+            )
+            original_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            liabilities_table.setItem(liability_row, 2, original_item)
+            inr_item = QTableWidgetItem(format_currency(float(item["outstanding_inr"] or 0), "INR"))
+            inr_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            inr_item.setForeground(QColor("#c23b31"))
+            liabilities_table.setItem(liability_row, 3, inr_item)
+            liabilities_table.setRowHeight(liability_row, 28)
+        self._fit_snapshot_table_height(liabilities_table)
+        details_layout.addWidget(liabilities_table)
+
+        details.setVisible(snapshot_id in self.expanded_snapshot_ids)
+        card_layout.addWidget(details)
+        card.details = details
 
     def _get_snapshot_asset_items(self, snapshot_id: int) -> list[object]:
         if snapshot_id not in self.snapshot_assets_cache:
@@ -3468,6 +4689,29 @@ class PortfolioWindow(QMainWindow):
         else:
             self.expanded_snapshot_ids = {snapshot_id}
         self._populate_snapshot_history_table(self.net_worth_snapshots)
+
+    def _delete_snapshot(self, snapshot_id: int, snapshot_name: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        choice = QMessageBox.question(
+            self,
+            "Delete snapshot",
+            f"Are you sure you want to delete '{snapshot_name}'? This action cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if choice != QMessageBox.Yes:
+            return
+
+        try:
+            delete_snapshot(snapshot_id)
+        except Exception as e:
+            QMessageBox.critical(self, "Delete failed", f"Unable to delete this snapshot:\n{e}")
+            return
+
+        if snapshot_id in self.expanded_snapshot_ids:
+            self.expanded_snapshot_ids.remove(snapshot_id)
+            
+        self._refresh_net_worth_view()
 
     def _refresh_net_worth_view(self) -> None:
         if not hasattr(self, "net_worth_snapshot_count_label"):

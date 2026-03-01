@@ -223,6 +223,31 @@ def _ensure_snapshot_line_items_tables(connection: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_user_settings_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            age INTEGER DEFAULT NULL,
+            monthly_income REAL DEFAULT NULL,
+            monthly_expense REAL DEFAULT NULL,
+            monthly_savings REAL DEFAULT NULL,
+            display_name TEXT DEFAULT NULL,
+            email TEXT DEFAULT NULL,
+            password_hash TEXT DEFAULT NULL,
+            app_pin TEXT DEFAULT NULL,
+            base_currency TEXT DEFAULT 'INR'
+        )
+        """
+    )
+    # Ensure the single row exists immediately so frontend can blindly query/update it
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO user_settings (id, base_currency) VALUES (1, 'INR')
+        """
+    )
+
+
 def _seed_exchange_rates(connection: sqlite3.Connection) -> None:
     connection.executemany(
         """
@@ -338,6 +363,7 @@ def init_db() -> None:
         _ensure_liabilities_table(connection)
         _ensure_net_worth_snapshots_table(connection)
         _ensure_snapshot_line_items_tables(connection)
+        _ensure_user_settings_table(connection)
         _ensure_exchange_rates_table(connection)
         _seed_exchange_rates(connection)
         _migrate_assets(connection)
@@ -856,3 +882,64 @@ def update_asset_details(
                 asset_id,
             ),
         )
+
+
+def delete_snapshot(snapshot_id: int) -> int:
+    with get_connection() as connection:
+        connection.execute("DELETE FROM snapshot_asset_items WHERE snapshot_id = ?", (snapshot_id,))
+        connection.execute("DELETE FROM snapshot_liability_items WHERE snapshot_id = ?", (snapshot_id,))
+        result = connection.execute("DELETE FROM net_worth_snapshots WHERE id = ?", (snapshot_id,))
+        return result.rowcount
+
+
+def fetch_user_settings() -> sqlite3.Row | None:
+    with get_connection() as connection:
+        return connection.execute("SELECT * FROM user_settings WHERE id = 1").fetchone()
+
+
+def update_financial_profile(
+    age: int | None, income: float | None, expense: float | None, savings: float | None
+) -> None:
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE user_settings 
+            SET age = ?, monthly_income = ?, monthly_expense = ?, monthly_savings = ?
+            WHERE id = 1
+            """,
+            (age, income, expense, savings),
+        )
+        connection.commit()
+
+
+def update_user_profile(display_name: str | None, email: str | None) -> None:
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE user_settings 
+            SET display_name = ?, email = ?
+            WHERE id = 1
+            """,
+            (display_name, email),
+        )
+        connection.commit()
+
+
+def update_security(password_hash: str | None, app_pin: str | None) -> None:
+    with get_connection() as connection:
+        if password_hash is not None and app_pin is not None:
+             connection.execute("UPDATE user_settings SET password_hash = ?, app_pin = ? WHERE id = 1", (password_hash, app_pin))
+        elif password_hash is not None:
+             connection.execute("UPDATE user_settings SET password_hash = ? WHERE id = 1", (password_hash,))
+        elif app_pin is not None:
+             connection.execute("UPDATE user_settings SET app_pin = ? WHERE id = 1", (app_pin,))
+        connection.commit()
+
+
+def update_base_currency(currency: str) -> None:
+    with get_connection() as connection:
+        connection.execute(
+            "UPDATE user_settings SET base_currency = ? WHERE id = 1",
+            (currency,),
+        )
+        connection.commit()
