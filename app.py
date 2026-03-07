@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 import re
 import sys
 import unicodedata
 
-from PySide6.QtCore import QDateTime, QEvent, QItemSelectionModel, QPoint, QPointF, QSize, QTimer, Qt, QObject
+from PySide6.QtCore import QDateTime, QEvent, QItemSelectionModel, QMargins, QPoint, QPointF, QSize, QTimer, Qt, QObject
 from PySide6.QtCharts import QCategoryAxis, QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
 from PySide6.QtGui import (
     QColor,
@@ -35,7 +36,10 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
+    QMessageBox,
     QPushButton,
+    QProgressBar,
     QScrollArea,
     QSizePolicy,
     QSpacerItem,
@@ -71,6 +75,10 @@ from db import (
     update_asset_tag,
     update_assets_class,
     fetch_user_settings,
+    register_auth_user,
+    update_auth_session,
+    clear_auth_session,
+    reset_auth_password,
     update_financial_profile,
     update_user_profile,
     update_security,
@@ -176,6 +184,28 @@ def calculate_change_pct(invested: float, value: float) -> float:
 def parse_amount(text: str) -> float:
     cleaned = text.strip().replace(",", "")
     return float(cleaned)
+
+
+def hash_secret(raw_value: str) -> str:
+    return hashlib.sha256(raw_value.encode("utf-8")).hexdigest()
+
+
+def is_auth_registered(settings_row: object | None) -> bool:
+    if settings_row is None:
+        return False
+    return int(settings_row["auth_registered"] or 0) == 1
+
+
+def auth_password_matches(settings_row: object | None, raw_password: str) -> bool:
+    if settings_row is None:
+        return False
+
+    stored = (settings_row["password_hash"] or "").strip()
+    if not stored:
+        return False
+
+    candidate_hash = hash_secret(raw_password)
+    return stored == candidate_hash or stored == raw_password
 
 
 def asset_count_label(count: int) -> str:
@@ -322,12 +352,16 @@ class ChartHoverFilter(QObject):
 
 
 class GoalCard(QFrame):
-    def __init__(self, goal_data, current_savings, months_remaining, pmt):
+    def __init__(self, goal_data, current_savings, months_remaining, pmt, action_handler=None):
         super().__init__()
+        self.goal_data = dict(goal_data)
+        self.goal_status = str(self.goal_data.get("status") or "ACTIVE").upper()
+        self._action_handler = action_handler
+
         self.setObjectName("goalCard")
         self.setStyleSheet("QFrame#goalCard { background-color: #ffffff; border: 1px solid #d9d8d3; border-radius: 8px; }")
         self.setFixedWidth(340)
-        self.setFixedHeight(180)
+        self.setFixedHeight(220)
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -338,12 +372,38 @@ class GoalCard(QFrame):
         name_lbl = QLabel(goal_data["name"])
         name_lbl.setStyleSheet('font-family: "Segoe UI", sans-serif; font-size: 15px; font-weight: bold; color: #22211f; border: none;')
         header.addWidget(name_lbl)
+
+        if self.goal_status != "ACTIVE":
+            status_lbl = QLabel("Paused" if self.goal_status == "PAUSED" else "Achieved")
+            status_bg = "#f1ece2" if self.goal_status == "PAUSED" else "#e3efe8"
+            status_fg = "#6b6962" if self.goal_status == "PAUSED" else "#2b7a52"
+            status_lbl.setStyleSheet(
+                f"background-color: {status_bg}; color: {status_fg}; border-radius: 4px; "
+                "padding: 3px 6px; font-size: 10px; font-weight: 600;"
+            )
+            header.addWidget(status_lbl)
+
         header.addStretch()
+
+        if self._action_handler is not None:
+            menu_btn = QToolButton()
+            menu_btn.setText("⋯")
+            menu_btn.setCursor(Qt.PointingHandCursor)
+            menu_btn.setStyleSheet(
+                "QToolButton { border: none; color: #6b6962; font-size: 18px; padding: 0px 2px; }"
+                "QToolButton:hover { color: #22211f; }"
+            )
+            menu_btn.clicked.connect(lambda: self._show_context_menu_at(menu_btn.mapToGlobal(QPoint(0, menu_btn.height()))))
+            header.addWidget(menu_btn)
+
         layout.addLayout(header)
         
         # Subtitle
         year_str = goal_data["target_date"][:4]
-        cat_str = goal_data["asset_class_key"] or ("All Categories" if not goal_data.get("linked_asset_ids") else "Specific Assets")
+        if goal_data.get("linked_asset_ids"):
+            cat_str = "Specific Assets"
+        else:
+            cat_str = goal_data.get("tracking_label") or goal_data["asset_class_key"] or "All Categories"
         sub_lbl = QLabel(f"by {year_str} • {cat_str}")
         sub_lbl.setStyleSheet("font-size: 12px; color: #6b6962; border: none;")
         layout.addWidget(sub_lbl)
@@ -388,7 +448,15 @@ class GoalCard(QFrame):
         layout.addStretch()
         
         # Action string
-        if pct >= 100:
+        if self.goal_status == "ACHIEVED":
+            action_txt = "✓ Goal marked achieved"
+            action_color = "#2b7a52"
+            action_bg = "#e3efe8"
+        elif self.goal_status == "PAUSED":
+            action_txt = "Paused. Resume this goal to continue planning."
+            action_color = "#6b6962"
+            action_bg = "#f1ece2"
+        elif pct >= 100:
             action_txt = "Goal Reached! 🎉"
             action_color = "#2b7a52"
             action_bg = "#e3efe8"
@@ -403,7 +471,467 @@ class GoalCard(QFrame):
             
         action_pill = QLabel(action_txt)
         action_pill.setStyleSheet(f"background-color: {action_bg}; color: {action_color}; border-radius: 4px; padding: 6px; font-size: 11px; font-weight: 500;")
+        action_pill.setWordWrap(True)
         layout.addWidget(action_pill)
+
+    def contextMenuEvent(self, event) -> None:
+        if self._action_handler is None:
+            return super().contextMenuEvent(event)
+        self._show_context_menu_at(event.globalPos())
+        event.accept()
+
+    def _show_context_menu_at(self, global_pos: QPoint) -> None:
+        if self._action_handler is None:
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background-color: #ffffff; border: 1px solid #d9d8d3; padding: 4px 0; }"
+            "QMenu::item { padding: 8px 16px; color: #22211f; }"
+            "QMenu::item:selected { background-color: #f3f2ef; }"
+        )
+
+        view_action = menu.addAction("View")
+        edit_action = menu.addAction("Edit")
+        mark_action = None
+        pause_resume_action = None
+        if self.goal_status != "ACHIEVED":
+            mark_action = menu.addAction("Mark Achieved")
+            pause_resume_action = menu.addAction("Resume" if self.goal_status == "PAUSED" else "Pause")
+        menu.addSeparator()
+        delete_action = menu.addAction("Delete")
+
+        selected = menu.exec(global_pos)
+        if selected is None:
+            return
+        if selected == view_action:
+            self._action_handler("view", self.goal_data)
+        elif selected == edit_action:
+            self._action_handler("edit", self.goal_data)
+        elif mark_action is not None and selected == mark_action:
+            self._action_handler("mark_achieved", self.goal_data)
+        elif pause_resume_action is not None and selected == pause_resume_action:
+            action_name = "resume" if self.goal_status == "PAUSED" else "pause"
+            self._action_handler(action_name, self.goal_data)
+        elif selected == delete_action:
+            self._action_handler("delete", self.goal_data)
+
+
+class AuthDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Portfolio Tracker - Sign In")
+        self.setModal(True)
+        self.setMinimumSize(460, 560)
+        self.resize(460, 600)
+        self.setStyleSheet(
+            """
+            QDialog {
+                background: #f7f7f5;
+            }
+            QFrame#authCard {
+                background: #ffffff;
+                border: 1px solid #d9d8d3;
+                border-radius: 10px;
+            }
+            QLabel#authTitle {
+                font-size: 20px;
+                font-weight: 700;
+                color: #22211f;
+            }
+            QLabel#authSub {
+                font-size: 12px;
+                color: #6b6962;
+            }
+            QLabel#authLabel {
+                font-size: 11px;
+                color: #6b6962;
+                font-family: "Courier New", monospace;
+            }
+            QLineEdit {
+                border: 1px solid #d9d8d3;
+                border-radius: 6px;
+                background: #ffffff;
+                padding: 9px 10px;
+                min-height: 20px;
+                font-size: 13px;
+                color: #22211f;
+            }
+            QCheckBox {
+                font-size: 12px;
+                color: #3b3a36;
+            }
+            QPushButton#authPrimary {
+                background: #2b7a52;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                padding: 10px 14px;
+                min-height: 18px;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QPushButton#authPrimary:hover {
+                background: #236543;
+            }
+            QPushButton#authLink {
+                background: transparent;
+                color: #2b7a52;
+                border: none;
+                text-align: left;
+                padding: 4px 0;
+                font-size: 12px;
+            }
+            QPushButton#authLink:hover {
+                color: #1d5c3a;
+            }
+            QLabel#authError {
+                color: #c23b31;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            """
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 18, 22, 18)
+        root.setSpacing(0)
+
+        card = QFrame()
+        card.setObjectName("authCard")
+        card_l = QVBoxLayout(card)
+        card_l.setContentsMargins(22, 20, 22, 18)
+        card_l.setSpacing(10)
+        root.addWidget(card)
+
+        title = QLabel("Portfolio Tracker")
+        title.setObjectName("authTitle")
+        card_l.addWidget(title)
+
+        sub = QLabel("Sign in to continue")
+        sub.setObjectName("authSub")
+        card_l.addWidget(sub)
+        card_l.addSpacing(6)
+
+        self.auth_error = QLabel("")
+        self.auth_error.setObjectName("authError")
+        self.auth_error.hide()
+        card_l.addWidget(self.auth_error)
+
+        self.auth_stack = QStackedWidget()
+        card_l.addWidget(self.auth_stack, 1)
+
+        self._build_login_view()
+        self._build_register_view()
+        self._build_forgot_view()
+        self._normalize_auth_field_heights()
+
+        settings = fetch_user_settings()
+        if is_auth_registered(settings):
+            self.auth_stack.setCurrentWidget(self.login_page)
+            self.login_email_input.setText((settings["email"] or "").strip())
+            self.keep_login_cb.setChecked(bool(settings["keep_logged_in"]))
+        else:
+            self.auth_stack.setCurrentWidget(self.register_page)
+            self.register_keep_cb.setChecked(True)
+
+    def _normalize_auth_field_heights(self) -> None:
+        line_edits = self.findChildren(QLineEdit)
+        for line_edit in line_edits:
+            line_edit.setMinimumHeight(34)
+        buttons = self.findChildren(QPushButton)
+        for button in buttons:
+            if button.objectName() == "authPrimary":
+                button.setMinimumHeight(36)
+
+    def _set_auth_error(self, message: str) -> None:
+        if message:
+            self.auth_error.setText(message)
+            self.auth_error.show()
+        else:
+            self.auth_error.hide()
+            self.auth_error.setText("")
+
+    def _build_login_view(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        email_lbl = QLabel("Email")
+        email_lbl.setObjectName("authLabel")
+        layout.addWidget(email_lbl)
+        self.login_email_input = QLineEdit()
+        self.login_email_input.setPlaceholderText("you@example.com")
+        layout.addWidget(self.login_email_input)
+
+        password_lbl = QLabel("Password")
+        password_lbl.setObjectName("authLabel")
+        layout.addWidget(password_lbl)
+        self.login_password_input = QLineEdit()
+        self.login_password_input.setEchoMode(QLineEdit.Password)
+        self.login_password_input.setPlaceholderText("Enter password")
+        layout.addWidget(self.login_password_input)
+
+        self.keep_login_cb = QCheckBox("Keep me logged in")
+        layout.addWidget(self.keep_login_cb)
+        layout.addSpacing(4)
+
+        login_btn = QPushButton("Log In")
+        login_btn.setObjectName("authPrimary")
+        login_btn.setCursor(Qt.PointingHandCursor)
+        login_btn.clicked.connect(self._on_login_clicked)
+        layout.addWidget(login_btn)
+
+        links = QHBoxLayout()
+        forgot_btn = QPushButton("Forgot password?")
+        forgot_btn.setObjectName("authLink")
+        forgot_btn.setCursor(Qt.PointingHandCursor)
+        forgot_btn.clicked.connect(lambda: self._switch_auth_page("forgot"))
+        links.addWidget(forgot_btn)
+        links.addStretch()
+        register_btn = QPushButton("Create account")
+        register_btn.setObjectName("authLink")
+        register_btn.setCursor(Qt.PointingHandCursor)
+        register_btn.clicked.connect(lambda: self._switch_auth_page("register"))
+        links.addWidget(register_btn)
+        layout.addLayout(links)
+        layout.addStretch()
+
+        self.login_page = page
+        self.auth_stack.addWidget(page)
+
+    def _build_register_view(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        name_lbl = QLabel("Display Name")
+        name_lbl.setObjectName("authLabel")
+        layout.addWidget(name_lbl)
+        self.register_name_input = QLineEdit()
+        self.register_name_input.setPlaceholderText("Your name")
+        layout.addWidget(self.register_name_input)
+
+        email_lbl = QLabel("Email")
+        email_lbl.setObjectName("authLabel")
+        layout.addWidget(email_lbl)
+        self.register_email_input = QLineEdit()
+        self.register_email_input.setPlaceholderText("you@example.com")
+        layout.addWidget(self.register_email_input)
+
+        password_lbl = QLabel("Password")
+        password_lbl.setObjectName("authLabel")
+        layout.addWidget(password_lbl)
+        self.register_password_input = QLineEdit()
+        self.register_password_input.setEchoMode(QLineEdit.Password)
+        self.register_password_input.setPlaceholderText("Min 8 characters")
+        layout.addWidget(self.register_password_input)
+
+        confirm_lbl = QLabel("Confirm Password")
+        confirm_lbl.setObjectName("authLabel")
+        layout.addWidget(confirm_lbl)
+        self.register_confirm_input = QLineEdit()
+        self.register_confirm_input.setEchoMode(QLineEdit.Password)
+        self.register_confirm_input.setPlaceholderText("Re-enter password")
+        layout.addWidget(self.register_confirm_input)
+
+        pin_lbl = QLabel("Recovery PIN (4 digits)")
+        pin_lbl.setObjectName("authLabel")
+        layout.addWidget(pin_lbl)
+        self.register_pin_input = QLineEdit()
+        self.register_pin_input.setMaxLength(4)
+        self.register_pin_input.setPlaceholderText("Used for forgot password")
+        layout.addWidget(self.register_pin_input)
+
+        self.register_keep_cb = QCheckBox("Keep me logged in")
+        layout.addWidget(self.register_keep_cb)
+        layout.addSpacing(4)
+
+        register_btn = QPushButton("Register")
+        register_btn.setObjectName("authPrimary")
+        register_btn.setCursor(Qt.PointingHandCursor)
+        register_btn.clicked.connect(self._on_register_clicked)
+        layout.addWidget(register_btn)
+
+        login_link = QPushButton("Already have an account? Log in")
+        login_link.setObjectName("authLink")
+        login_link.setCursor(Qt.PointingHandCursor)
+        login_link.clicked.connect(lambda: self._switch_auth_page("login"))
+        layout.addWidget(login_link)
+        layout.addStretch()
+
+        self.register_page = page
+        self.auth_stack.addWidget(page)
+
+    def _build_forgot_view(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        helper = QLabel("Reset password with your registered email and recovery PIN.")
+        helper.setObjectName("authSub")
+        helper.setWordWrap(True)
+        layout.addWidget(helper)
+
+        email_lbl = QLabel("Email")
+        email_lbl.setObjectName("authLabel")
+        layout.addWidget(email_lbl)
+        self.forgot_email_input = QLineEdit()
+        self.forgot_email_input.setPlaceholderText("you@example.com")
+        layout.addWidget(self.forgot_email_input)
+
+        pin_lbl = QLabel("Recovery PIN")
+        pin_lbl.setObjectName("authLabel")
+        layout.addWidget(pin_lbl)
+        self.forgot_pin_input = QLineEdit()
+        self.forgot_pin_input.setMaxLength(4)
+        self.forgot_pin_input.setPlaceholderText("4-digit PIN")
+        layout.addWidget(self.forgot_pin_input)
+
+        new_password_lbl = QLabel("New Password")
+        new_password_lbl.setObjectName("authLabel")
+        layout.addWidget(new_password_lbl)
+        self.forgot_password_input = QLineEdit()
+        self.forgot_password_input.setEchoMode(QLineEdit.Password)
+        self.forgot_password_input.setPlaceholderText("Min 8 characters")
+        layout.addWidget(self.forgot_password_input)
+
+        confirm_lbl = QLabel("Confirm New Password")
+        confirm_lbl.setObjectName("authLabel")
+        layout.addWidget(confirm_lbl)
+        self.forgot_confirm_input = QLineEdit()
+        self.forgot_confirm_input.setEchoMode(QLineEdit.Password)
+        self.forgot_confirm_input.setPlaceholderText("Re-enter new password")
+        layout.addWidget(self.forgot_confirm_input)
+
+        reset_btn = QPushButton("Reset Password")
+        reset_btn.setObjectName("authPrimary")
+        reset_btn.setCursor(Qt.PointingHandCursor)
+        reset_btn.clicked.connect(self._on_forgot_clicked)
+        layout.addWidget(reset_btn)
+
+        back_btn = QPushButton("Back to login")
+        back_btn.setObjectName("authLink")
+        back_btn.setCursor(Qt.PointingHandCursor)
+        back_btn.clicked.connect(lambda: self._switch_auth_page("login"))
+        layout.addWidget(back_btn)
+        layout.addStretch()
+
+        self.forgot_page = page
+        self.auth_stack.addWidget(page)
+
+    def _switch_auth_page(self, page_name: str) -> None:
+        self._set_auth_error("")
+        if page_name == "register":
+            self.auth_stack.setCurrentWidget(self.register_page)
+        elif page_name == "forgot":
+            self.auth_stack.setCurrentWidget(self.forgot_page)
+            self.forgot_email_input.setText(self.login_email_input.text().strip())
+        else:
+            self.auth_stack.setCurrentWidget(self.login_page)
+            self.login_password_input.clear()
+
+    def _on_login_clicked(self) -> None:
+        self._set_auth_error("")
+        email = self.login_email_input.text().strip()
+        password = self.login_password_input.text()
+        if not email or not password:
+            self._set_auth_error("Enter both email and password.")
+            return
+
+        settings = fetch_user_settings()
+        if not is_auth_registered(settings):
+            self._set_auth_error("No account found. Please register first.")
+            self._switch_auth_page("register")
+            return
+
+        stored_email = (settings["email"] or "").strip()
+        if stored_email.casefold() != email.casefold():
+            self._set_auth_error("Email does not match the registered account.")
+            return
+
+        if not auth_password_matches(settings, password):
+            self._set_auth_error("Invalid password.")
+            return
+
+        # Migrate legacy plain-text password to hash on first successful sign-in.
+        if (settings["password_hash"] or "") != hash_secret(password):
+            update_security(password_hash=hash_secret(password), app_pin=None)
+
+        update_auth_session(True, keep_logged_in=self.keep_login_cb.isChecked())
+        self.accept()
+
+    def _on_register_clicked(self) -> None:
+        self._set_auth_error("")
+        name = self.register_name_input.text().strip()
+        email = self.register_email_input.text().strip()
+        password = self.register_password_input.text()
+        confirm = self.register_confirm_input.text()
+        pin = self.register_pin_input.text().strip()
+
+        if not name:
+            self._set_auth_error("Display Name is required.")
+            return
+        if not email or "@" not in email:
+            self._set_auth_error("Enter a valid email address.")
+            return
+        if len(password) < 8:
+            self._set_auth_error("Password must be at least 8 characters.")
+            return
+        if password != confirm:
+            self._set_auth_error("Password confirmation does not match.")
+            return
+        if len(pin) != 4 or not pin.isdigit():
+            self._set_auth_error("Recovery PIN must be exactly 4 digits.")
+            return
+
+        settings = fetch_user_settings()
+        if is_auth_registered(settings):
+            self._set_auth_error("Account already exists. Please log in.")
+            self._switch_auth_page("login")
+            return
+
+        register_auth_user(
+            display_name=name,
+            email=email,
+            password_hash=hash_secret(password),
+            app_pin=pin,
+            keep_logged_in=self.register_keep_cb.isChecked(),
+        )
+        self.accept()
+
+    def _on_forgot_clicked(self) -> None:
+        self._set_auth_error("")
+        email = self.forgot_email_input.text().strip()
+        pin = self.forgot_pin_input.text().strip()
+        password = self.forgot_password_input.text()
+        confirm = self.forgot_confirm_input.text()
+
+        if not email:
+            self._set_auth_error("Email is required.")
+            return
+        if len(pin) != 4 or not pin.isdigit():
+            self._set_auth_error("Recovery PIN must be exactly 4 digits.")
+            return
+        if len(password) < 8:
+            self._set_auth_error("New password must be at least 8 characters.")
+            return
+        if password != confirm:
+            self._set_auth_error("Password confirmation does not match.")
+            return
+
+        ok = reset_auth_password(email=email, app_pin=pin, new_password_hash=hash_secret(password))
+        if not ok:
+            self._set_auth_error("Unable to reset password. Check email and recovery PIN.")
+            return
+
+        self._switch_auth_page("login")
+        self.login_email_input.setText(email)
+        self.login_password_input.clear()
+        self._set_auth_error("Password reset successful. Please log in.")
 
 class PortfolioWindow(QMainWindow):
     ASSETS_PAGE_INDEX = 0
@@ -415,6 +943,7 @@ class PortfolioWindow(QMainWindow):
     SETTINGS_PAGE_INDEX = 6
     ALLOCATION_PAGE_INDEX = 7
     GOALS_PAGE_INDEX = 8
+    DASHBOARD_PAGE_INDEX = 9
 
     def __init__(self) -> None:
         super().__init__()
@@ -474,6 +1003,8 @@ class PortfolioWindow(QMainWindow):
         self._refresh_assets_view()
         self._refresh_liabilities_view()
         self._refresh_net_worth_view()
+        self._refresh_dashboard_view()
+        self._show_dashboard_page()
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -1159,9 +1690,9 @@ class PortfolioWindow(QMainWindow):
             for item in items:
                 button = QPushButton(item)
                 button.setObjectName("navItem")
-                button.setProperty("active", item == "Assets")
+                button.setProperty("active", item == "Dashboard")
                 button.setCursor(Qt.PointingHandCursor)
-                if item in {"Assets", "Liabilities", "Net Worth", "Essentials", "Allocation", "Goals"}:
+                if item in {"Dashboard", "Assets", "Liabilities", "Net Worth", "Essentials", "Allocation", "Goals"}:
                     button.clicked.connect(
                         lambda _checked=False, selected_item=item: self._on_sidebar_navigation(selected_item)
                     )
@@ -1189,6 +1720,7 @@ class PortfolioWindow(QMainWindow):
         self.content_stack.addWidget(self._build_settings_page())
         self.content_stack.addWidget(self._build_allocation_page())
         self.content_stack.addWidget(self._build_goals_page())
+        self.content_stack.addWidget(self._build_dashboard_page())  # index 9
         content_layout.addWidget(self.content_stack, 1)
         return content
 
@@ -1204,15 +1736,63 @@ class PortfolioWindow(QMainWindow):
         theme_button.setCursor(Qt.PointingHandCursor)
         layout.addWidget(theme_button)
 
-        user_label = QLabel("Hewitt Vijayan")
-        user_label.setObjectName("userLabel")
-        layout.addWidget(user_label)
+        self.profile_user_label = QLabel("")
+        self.profile_user_label.setObjectName("userLabel")
+        layout.addWidget(self.profile_user_label)
 
-        menu_button = QPushButton("v")
-        menu_button.setObjectName("iconButton")
-        menu_button.setCursor(Qt.PointingHandCursor)
-        layout.addWidget(menu_button)
+        self.profile_menu_button = QPushButton("v")
+        self.profile_menu_button.setObjectName("iconButton")
+        self.profile_menu_button.setCursor(Qt.PointingHandCursor)
+        self.profile_menu_button.clicked.connect(self._show_profile_menu)
+        layout.addWidget(self.profile_menu_button)
+        self._refresh_profile_bar_identity()
         return top
+
+    def _refresh_profile_bar_identity(self) -> None:
+        if not hasattr(self, "profile_user_label"):
+            return
+        settings = fetch_user_settings()
+        display_name = (settings["display_name"] or "").strip() if settings else ""
+        email = (settings["email"] or "").strip() if settings else ""
+        identity = display_name or email or "Guest"
+        self.profile_user_label.setText(identity)
+
+    def _show_profile_menu(self) -> None:
+        if not hasattr(self, "profile_menu_button"):
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background: #ffffff; border: 1px solid #d9d8d3; padding: 4px 0; }"
+            "QMenu::item { padding: 8px 16px; color: #22211f; }"
+            "QMenu::item:selected { background: #f3f2ef; }"
+        )
+        logout_action = menu.addAction("Log out")
+        chosen = menu.exec(self.profile_menu_button.mapToGlobal(QPoint(0, self.profile_menu_button.height())))
+        if chosen == logout_action:
+            self._logout_user()
+
+    def _logout_user(self) -> None:
+        choice = QMessageBox.question(
+            self,
+            "Log out",
+            "Log out from this app?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if choice != QMessageBox.Yes:
+            return
+
+        clear_auth_session()
+        self.hide()
+        auth_dialog = AuthDialog(self)
+        if auth_dialog.exec() == QDialog.Accepted:
+            self._refresh_profile_bar_identity()
+            self.show()
+            self._refresh_dashboard_view()
+        else:
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
 
     def _build_essentials_page(self) -> QWidget:
         page = QWidget()
@@ -1688,6 +2268,7 @@ class PortfolioWindow(QMainWindow):
             name_val = name_input.text().strip()
             email_val = email_input.text().strip()
             update_user_profile(name_val, email_val)
+            self._refresh_profile_bar_identity()
             print(f"Saved Profile: Name={name_val}, Email={email_val}")
             save_btn.setEnabled(False)
             saved_lbl.show()
@@ -1825,7 +2406,7 @@ class PortfolioWindow(QMainWindow):
         
         def save_password():
             if new_pwd_input.text() == conf_pwd_input.text() and len(new_pwd_input.text()) >= 8:
-                update_security(password_hash=new_pwd_input.text(), app_pin=None)
+                update_security(password_hash=hash_secret(new_pwd_input.text()), app_pin=None)
                 print("Saved new password")
                 new_pwd_input.clear()
                 conf_pwd_input.clear()
@@ -4660,6 +5241,8 @@ class PortfolioWindow(QMainWindow):
             self._show_allocation_page()
         elif item_name == "Goals":
             self._show_goals_page()
+        elif item_name == "Dashboard":
+            self._show_dashboard_page()
 
     def _set_net_worth_mode(self, mode: str) -> None:
         if self.net_worth_view_mode == mode:
@@ -6124,23 +6707,14 @@ class PortfolioWindow(QMainWindow):
         layout.setContentsMargins(40, 40, 40, 40)
         layout.setSpacing(32)
         
-        # Section 1: Active Goals Gallery
-        self.active_goals_layout = QHBoxLayout()
-        self.active_goals_layout.setSpacing(16)
-        
-        goals_scroll = QScrollArea()
-        goals_scroll.setWidgetResizable(True)
-        goals_scroll.setFixedHeight(220)
-        goals_scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
-        goals_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        goals_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        
+        # Section 1: Active Goals Gallery (wrapped rows)
         self.goals_container = QWidget()
         self.goals_container.setStyleSheet("background-color: transparent;")
-        self.goals_container.setLayout(self.active_goals_layout)
-        goals_scroll.setWidget(self.goals_container)
-        
-        layout.addWidget(goals_scroll)
+        self.active_goals_layout = QGridLayout(self.goals_container)
+        self.active_goals_layout.setSpacing(16)
+        self.active_goals_layout.setContentsMargins(0, 0, 0, 0)
+        self.active_goals_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        layout.addWidget(self.goals_container)
         
         # Section 2: Create Goal Form
         create_panel = QFrame()
@@ -6195,6 +6769,25 @@ class PortfolioWindow(QMainWindow):
         self.goal_class_combo.setMinimumHeight(35)
         self.goal_class_combo.setStyleSheet("border: 1px solid #d9d8d3; border-radius: 4px; padding: 0 8px;")
         create_layout.addWidget(self.goal_class_combo)
+
+        create_layout.addWidget(QLabel("Link Specific Assets (optional)"))
+        self.goal_assets_hint = QLabel("Selecting specific assets overrides Track Progress By.")
+        self.goal_assets_hint.setStyleSheet("font-size: 11px; color: #6b6962; border: none;")
+        create_layout.addWidget(self.goal_assets_hint)
+
+        self.goal_assets_scroll = QScrollArea()
+        self.goal_assets_scroll.setWidgetResizable(True)
+        self.goal_assets_scroll.setFixedHeight(160)
+        self.goal_assets_scroll.setStyleSheet(
+            "QScrollArea { border: 1px solid #d9d8d3; border-radius: 4px; background-color: #ffffff; }"
+        )
+        self.goal_assets_container = QWidget()
+        self.goal_assets_layout = QVBoxLayout(self.goal_assets_container)
+        self.goal_assets_layout.setContentsMargins(10, 8, 10, 8)
+        self.goal_assets_layout.setSpacing(6)
+        self.goal_assets_scroll.setWidget(self.goal_assets_container)
+        create_layout.addWidget(self.goal_assets_scroll)
+        self.goal_asset_checkboxes: dict[int, QCheckBox] = {}
         
         create_btn_row = QHBoxLayout()
         self.create_goal_btn = QPushButton("Create Goal")
@@ -6213,108 +6806,1623 @@ class PortfolioWindow(QMainWindow):
         scroll.setWidget(container)
         return scroll
 
+    def _selected_goal_asset_ids(self) -> list[int]:
+        if not hasattr(self, "goal_asset_checkboxes"):
+            return []
+        return sorted(aid for aid, cb in self.goal_asset_checkboxes.items() if cb.isChecked())
+
+    def _refresh_goal_asset_selector(
+        self,
+        assets: list[object],
+        target_layout: QVBoxLayout | None = None,
+        checkbox_store: dict[int, QCheckBox] | None = None,
+        selected_ids: set[int] | None = None,
+    ) -> dict[int, QCheckBox]:
+        layout = target_layout if target_layout is not None else getattr(self, "goal_assets_layout", None)
+        if layout is None:
+            return {} if checkbox_store is None else checkbox_store
+
+        store = checkbox_store if checkbox_store is not None else getattr(self, "goal_asset_checkboxes", {})
+        preserved_selected = selected_ids
+        if preserved_selected is None:
+            preserved_selected = {aid for aid, cb in store.items() if cb.isChecked()}
+
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        store.clear()
+
+        if not assets:
+            empty_lbl = QLabel("No investments found. Add assets to link them to a goal.")
+            empty_lbl.setStyleSheet("font-size: 11px; color: #6b6962; border: none;")
+            empty_lbl.setWordWrap(True)
+            layout.addWidget(empty_lbl)
+            return store
+
+        for asset in sorted(assets, key=lambda row: str(row["name"] or "").lower()):
+            aid = int(asset["id"])
+            asset_name = asset["name"] or f"Asset {aid}"
+            class_row = self.class_lookup.get(asset["class_key"])
+            class_name = class_row["class_name"] if class_row else (asset["class_key"] or "Unclassified")
+            value_text = format_compact_inr(float(asset["value"] or 0))
+            cb = QCheckBox(f"{asset_name} • {class_name} • {value_text}")
+            cb.setStyleSheet("font-size: 12px; color: #22211f;")
+            cb.setChecked(aid in preserved_selected)
+            store[aid] = cb
+            layout.addWidget(cb)
+
+        layout.addStretch()
+        return store
+
+    def _goal_tracking_label(self, goal_data: dict) -> str:
+        if goal_data.get("linked_asset_ids"):
+            return "Specific Assets"
+        category_key = goal_data.get("asset_class_key")
+        if not category_key:
+            return "All Categories"
+        return self.category_lookup.get(category_key, str(category_key).replace("_", " ").title())
+
+    def _goal_created_at(self, goal_data: dict) -> datetime:
+        raw = str(goal_data.get("created_at") or "").strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(raw, fmt)
+            except ValueError:
+                continue
+        return datetime.now()
+
+    def _asset_matches_goal_tracking(self, asset: object, goal_data: dict) -> bool:
+        linked_ids = {int(aid) for aid in goal_data.get("linked_asset_ids") or []}
+        if linked_ids:
+            return int(asset["id"]) in linked_ids
+
+        tracked_category = goal_data.get("asset_class_key")
+        if not tracked_category:
+            return True
+
+        class_row = self.class_lookup.get(asset["class_key"])
+        asset_category = class_row["category_key"] if class_row else None
+        return asset_category == tracked_category
+
+    def _calculate_goal_current_savings(self, goal_data: dict, assets: list[object]) -> float:
+        total = 0.0
+        for asset in assets:
+            if self._asset_matches_goal_tracking(asset, goal_data):
+                total += self._convert_to_inr(float(asset["value"] or 0), asset["currency"])
+        return total
+
+    def _calculate_goal_metrics(self, goal_data: dict, assets: list[object]) -> dict[str, float]:
+        target_amt = float(goal_data["target_amount"] or 0)
+        ret_pct = float(goal_data["expected_return_pct"] or 0)
+        current_savings = self._calculate_goal_current_savings(goal_data, assets)
+        progress_pct = min(100.0, max(0.0, (current_savings / target_amt) * 100)) if target_amt > 0 else 0.0
+
+        months_remaining = calculate_months_remaining(goal_data["target_date"])
+        monthly_needed = calculate_required_pmt(target_amt, current_savings, ret_pct, months_remaining)
+        remaining_amt = max(0.0, target_amt - current_savings)
+
+        now = datetime.now()
+        created_at = self._goal_created_at(goal_data)
+        try:
+            target_date = datetime.strptime(goal_data["target_date"], "%Y-%m-%d")
+        except ValueError:
+            target_date = now
+
+        total_days = (target_date - created_at).days
+        elapsed_days = max(0, (now - created_at).days)
+        if total_days <= 0:
+            time_elapsed_pct = 100.0 if now >= target_date else 0.0
+        else:
+            time_elapsed_pct = min(100.0, max(0.0, (elapsed_days / total_days) * 100.0))
+        days_remaining = max(0, (target_date.date() - now.date()).days)
+
+        return {
+            "current_savings": current_savings,
+            "target_amount": target_amt,
+            "progress_pct": progress_pct,
+            "months_remaining": float(months_remaining),
+            "monthly_needed": monthly_needed,
+            "remaining_amount": remaining_amt,
+            "time_elapsed_pct": time_elapsed_pct,
+            "days_remaining": float(days_remaining),
+            "expected_return_pct": ret_pct,
+        }
+
     def _refresh_goals_view(self):
-        # Fetch goals and populate self.active_goals_layout
         from db import fetch_categories, fetch_assets, fetch_goals
-        
-        # Clear Categories combo if needed and refill safely
+
         current_idx = self.goal_class_combo.currentIndex()
         self.goal_class_combo.blockSignals(True)
         self.goal_class_combo.clear()
         self.goal_class_combo.addItem("All Categories", "")
         for cat in fetch_categories():
             self.goal_class_combo.addItem(cat["category_name"], cat["category_key"])
-        if current_idx >= 0 and current_idx < self.goal_class_combo.count():
+        if 0 <= current_idx < self.goal_class_combo.count():
             self.goal_class_combo.setCurrentIndex(current_idx)
         self.goal_class_combo.blockSignals(False)
-        
-        # Clear existing GoalCards
-        for i in reversed(range(self.active_goals_layout.count())): 
-            item = self.active_goals_layout.itemAt(i)
-            if item.widget():
-                item.widget().setParent(None)
-                
-        # Fetch Data
+
+        while self.active_goals_layout.count():
+            item = self.active_goals_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
         assets = fetch_assets()
+        self._refresh_goal_asset_selector(assets)
         goals = fetch_goals()
-        
-        for g in goals:
-            target_amt = float(g["target_amount"])
-            ret_pct = float(g["expected_return_pct"])
-            months = calculate_months_remaining(g["target_date"])
-            
-            # Calculate PV
-            current_savings = 0.0
-            for a in assets:
-                is_linked = False
-                if g.get("linked_asset_ids") and a["id"] in g["linked_asset_ids"]:
-                    is_linked = True
-                elif not g.get("linked_asset_ids"):
-                    if not g.get("asset_class_key") or g.get("asset_class_key") == a["class_key"]:
-                        is_linked = True
-                
-                if is_linked:
-                    current_savings += float(a["value"])
-            
-            # Calculate PMT
-            pmt = calculate_required_pmt(target_amt, current_savings, ret_pct, months)
-            
-            card = GoalCard(g, current_savings, months, pmt)
-            self.active_goals_layout.addWidget(card)
-        
-        self.active_goals_layout.addStretch()
+
+        card_width = 340
+        spacing = self.active_goals_layout.horizontalSpacing()
+        if spacing < 0:
+            spacing = 16
+        available_width = self.goals_container.width()
+        if available_width <= 0:
+            available_width = max(360, self.content_stack.width() - 120)
+        columns = max(1, int((available_width + spacing) / (card_width + spacing)))
+
+        for idx, goal in enumerate(goals):
+            goal["tracking_label"] = self._goal_tracking_label(goal)
+            metrics = self._calculate_goal_metrics(goal, assets)
+            card = GoalCard(
+                goal,
+                metrics["current_savings"],
+                int(metrics["months_remaining"]),
+                metrics["monthly_needed"],
+                self._on_goal_card_action,
+            )
+            row = idx // columns
+            col = idx % columns
+            self.active_goals_layout.addWidget(card, row, col)
+
+        for col in range(0, 10):
+            self.active_goals_layout.setColumnStretch(col, 0)
+        self.active_goals_layout.setColumnStretch(columns, 1)
 
     def _on_create_goal(self):
         from db import create_goal
-        
+
         name = self.goal_name_input.text().strip()
         if not name:
-            self._show_error("Goal Name is required.")
+            QMessageBox.warning(self, "Create goal", "Goal Name is required.")
             return
-            
+
         amt_str = self.goal_amount_input.text().strip()
         try:
-            target_amount = float(amt_str)
+            target_amount = parse_amount(amt_str)
             if target_amount <= 0:
                 raise ValueError
         except ValueError:
-            self._show_error("Target Amount must be a positive number.")
+            QMessageBox.warning(self, "Create goal", "Target Amount must be a positive number.")
             return
-            
+
         date_str = self.goal_date_input.text().strip()
-        # Basic YYYY-MM-DD check
         try:
             datetime.strptime(date_str, "%Y-%m-%d")
         except ValueError:
-            self._show_error("Date must be in YYYY-MM-DD format.")
+            QMessageBox.warning(self, "Create goal", "Date must be in YYYY-MM-DD format.")
             return
-            
+
         ret_str = self.goal_return_input.text().strip()
         try:
             ret_pct = float(ret_str)
         except ValueError:
-            self._show_error("Expected Return must be a number.")
+            QMessageBox.warning(self, "Create goal", "Expected Return must be a number.")
             return
-            
-        cat_key = self.goal_class_combo.currentData()
-        if cat_key == "":
-            cat_key = None
-            
-        try:
-            create_goal(name, target_amount, date_str, ret_pct, cat_key, [])
-            self.goal_name_input.clear()
-            self.goal_amount_input.clear()
-            self.goal_date_input.clear()
-            self._show_success("Goal created successfully!")
-            self._refresh_goals_view()
-        except Exception as e:
-            self._show_error("Failed to create goal.")
 
+        linked_asset_ids = self._selected_goal_asset_ids()
+        cat_key = self.goal_class_combo.currentData()
+        if cat_key == "" or linked_asset_ids:
+            cat_key = None
+
+        try:
+            create_goal(name, target_amount, date_str, ret_pct, cat_key, linked_asset_ids)
+        except Exception:
+            QMessageBox.critical(self, "Create goal", "Failed to create goal.")
+            return
+
+        self.goal_name_input.clear()
+        self.goal_amount_input.clear()
+        self.goal_date_input.clear()
+        for cb in self.goal_asset_checkboxes.values():
+            cb.setChecked(False)
+        self._refresh_goals_view()
+        self._refresh_dashboard_view()
+        self._show_toast("Goal created")
+
+    def _on_goal_card_action(self, action_name: str, goal_data: dict) -> None:
+        from db import fetch_goal_by_id
+
+        goal_id = int(goal_data["id"])
+        latest_goal = fetch_goal_by_id(goal_id)
+        if latest_goal is None:
+            self._refresh_goals_view()
+            return
+
+        if action_name == "view":
+            self._open_goal_summary_dialog(goal_id)
+        elif action_name == "edit":
+            self._open_goal_edit_dialog(goal_id)
+        elif action_name == "pause":
+            self._set_goal_status(goal_id, "PAUSED", "Goal paused")
+        elif action_name == "resume":
+            self._set_goal_status(goal_id, "ACTIVE", "Goal resumed")
+        elif action_name == "mark_achieved":
+            self._set_goal_status(goal_id, "ACHIEVED", "Goal marked achieved")
+        elif action_name == "delete":
+            self._confirm_goal_delete(latest_goal)
+
+    def _set_goal_status(self, goal_id: int, status: str, success_message: str) -> None:
+        from db import update_goal_status
+
+        try:
+            update_goal_status(goal_id, status)
+        except Exception:
+            QMessageBox.critical(self, "Goal update", "Unable to update goal status.")
+            return
+
+        self._refresh_goals_view()
+        self._refresh_dashboard_view()
+        self._show_toast(success_message)
+
+    def _confirm_goal_delete(self, goal_data: dict) -> bool:
+        from db import delete_goal
+
+        choice = QMessageBox.question(
+            self,
+            "Delete goal",
+            f"Delete '{goal_data['name']}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if choice != QMessageBox.Yes:
+            return False
+
+        try:
+            delete_goal(int(goal_data["id"]))
+        except Exception:
+            QMessageBox.critical(self, "Delete goal", "Unable to delete this goal.")
+            return False
+
+        self._refresh_goals_view()
+        self._refresh_dashboard_view()
+        self._show_toast("Goal deleted")
+        return True
+
+    def _open_goal_edit_dialog(self, goal_id: int) -> None:
+        from db import fetch_assets, fetch_categories, fetch_goal_by_id, update_goal
+
+        goal_data = fetch_goal_by_id(goal_id)
+        if goal_data is None:
+            QMessageBox.warning(self, "Edit goal", "Goal was not found.")
+            self._refresh_goals_view()
+            return
+
+        assets = fetch_assets()
+        categories = fetch_categories()
+        selected_asset_ids = {int(aid) for aid in goal_data.get("linked_asset_ids") or []}
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Goal")
+        dialog.setModal(True)
+        dialog.resize(760, 540)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        title = QLabel(f"Edit Goal • {goal_data['name']}")
+        title.setStyleSheet('font-family: "Segoe UI"; font-size: 16px; font-weight: 700; color: #22211f;')
+        layout.addWidget(title)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+
+        grid.addWidget(QLabel("Goal Name *"), 0, 0)
+        name_input = QLineEdit(goal_data["name"])
+        name_input.setMinimumHeight(35)
+        name_input.setStyleSheet("border: 1px solid #d9d8d3; border-radius: 4px; padding: 0 8px;")
+        grid.addWidget(name_input, 1, 0)
+
+        grid.addWidget(QLabel("Target Date *"), 0, 1)
+        date_input = QLineEdit(goal_data["target_date"])
+        date_input.setMinimumHeight(35)
+        date_input.setStyleSheet("border: 1px solid #d9d8d3; border-radius: 4px; padding: 0 8px;")
+        grid.addWidget(date_input, 1, 1)
+
+        grid.addWidget(QLabel("Target Amount *"), 2, 0)
+        raw_target_amount = float(goal_data["target_amount"] or 0)
+        amount_text = f"{raw_target_amount:.2f}".rstrip("0").rstrip(".")
+        amount_input = QLineEdit(amount_text)
+        amount_input.setMinimumHeight(35)
+        amount_input.setStyleSheet("border: 1px solid #d9d8d3; border-radius: 4px; padding: 0 8px;")
+        grid.addWidget(amount_input, 3, 0)
+
+        grid.addWidget(QLabel("Expected Return (% p.a.)"), 2, 1)
+        return_input = QLineEdit(str(goal_data["expected_return_pct"]))
+        return_input.setMinimumHeight(35)
+        return_input.setStyleSheet("border: 1px solid #d9d8d3; border-radius: 4px; padding: 0 8px;")
+        grid.addWidget(return_input, 3, 1)
+
+        layout.addLayout(grid)
+
+        layout.addWidget(QLabel("Track Progress By"))
+        class_combo = QComboBox()
+        class_combo.setMinimumHeight(35)
+        class_combo.setStyleSheet("border: 1px solid #d9d8d3; border-radius: 4px; padding: 0 8px;")
+        class_combo.addItem("All Categories", "")
+        for cat in categories:
+            class_combo.addItem(cat["category_name"], cat["category_key"])
+        active_cat = goal_data.get("asset_class_key") or ""
+        class_index = class_combo.findData(active_cat)
+        class_combo.setCurrentIndex(class_index if class_index >= 0 else 0)
+        layout.addWidget(class_combo)
+
+        layout.addWidget(QLabel("Link Specific Assets (optional)"))
+        hint_lbl = QLabel("Selecting specific assets overrides Track Progress By.")
+        hint_lbl.setStyleSheet("font-size: 11px; color: #6b6962; border: none;")
+        layout.addWidget(hint_lbl)
+
+        assets_scroll = QScrollArea()
+        assets_scroll.setWidgetResizable(True)
+        assets_scroll.setFixedHeight(170)
+        assets_scroll.setStyleSheet("QScrollArea { border: 1px solid #d9d8d3; border-radius: 4px; background: #fff; }")
+        assets_container = QWidget()
+        assets_layout = QVBoxLayout(assets_container)
+        assets_layout.setContentsMargins(10, 8, 10, 8)
+        assets_layout.setSpacing(6)
+        assets_scroll.setWidget(assets_container)
+        layout.addWidget(assets_scroll)
+
+        edit_checkboxes: dict[int, QCheckBox] = {}
+        self._refresh_goal_asset_selector(
+            assets,
+            target_layout=assets_layout,
+            checkbox_store=edit_checkboxes,
+            selected_ids=selected_asset_ids,
+        )
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("secondaryButton")
+        cancel_btn.setCursor(Qt.PointingHandCursor)
+        cancel_btn.clicked.connect(dialog.reject)
+        actions.addWidget(cancel_btn)
+
+        save_btn = QPushButton("Save")
+        save_btn.setObjectName("primaryButton")
+        save_btn.setCursor(Qt.PointingHandCursor)
+        actions.addWidget(save_btn)
+        layout.addLayout(actions)
+
+        def save_goal() -> None:
+            name = name_input.text().strip()
+            if not name:
+                QMessageBox.warning(dialog, "Edit goal", "Goal Name is required.")
+                return
+
+            amount_text = amount_input.text().strip()
+            try:
+                target_amount = parse_amount(amount_text)
+                if target_amount <= 0:
+                    raise ValueError
+            except ValueError:
+                QMessageBox.warning(dialog, "Edit goal", "Target Amount must be a positive number.")
+                return
+
+            target_date = date_input.text().strip()
+            try:
+                datetime.strptime(target_date, "%Y-%m-%d")
+            except ValueError:
+                QMessageBox.warning(dialog, "Edit goal", "Date must be in YYYY-MM-DD format.")
+                return
+
+            try:
+                expected_return = float(return_input.text().strip())
+            except ValueError:
+                QMessageBox.warning(dialog, "Edit goal", "Expected Return must be a number.")
+                return
+
+            linked_assets = sorted(aid for aid, cb in edit_checkboxes.items() if cb.isChecked())
+            category_key = class_combo.currentData()
+            if category_key == "" or linked_assets:
+                category_key = None
+
+            try:
+                update_goal(
+                    goal_id,
+                    name,
+                    target_amount,
+                    target_date,
+                    expected_return,
+                    category_key,
+                    linked_assets,
+                )
+            except Exception:
+                QMessageBox.critical(dialog, "Edit goal", "Failed to update goal.")
+                return
+
+            dialog.accept()
+            self._refresh_goals_view()
+            self._refresh_dashboard_view()
+            self._show_toast("Goal updated")
+
+        save_btn.clicked.connect(save_goal)
+        dialog.exec()
+
+    def _open_goal_summary_dialog(self, goal_id: int) -> None:
+        from db import fetch_assets, fetch_goal_by_id
+
+        goal_data = fetch_goal_by_id(goal_id)
+        if goal_data is None:
+            QMessageBox.warning(self, "View goal", "Goal was not found.")
+            self._refresh_goals_view()
+            return
+
+        assets = fetch_assets()
+        metrics = self._calculate_goal_metrics(goal_data, assets)
+        status = str(goal_data.get("status") or "ACTIVE").upper()
+        tracking_label = self._goal_tracking_label(goal_data)
+
+        dialog = QDialog(self)
+        dialog.setModal(True)
+        dialog.setWindowTitle(goal_data["name"])
+        dialog.resize(600, 640)
+        dialog.setStyleSheet(
+            """
+            QDialog {
+                background: #f7f7f4;
+            }
+            QLabel {
+                border: none;
+                background: transparent;
+            }
+            QFrame#goalSummaryCallout {
+                border: none;
+                border-radius: 10px;
+            }
+            QFrame#goalSummaryInfoCard {
+                background: #f0efe9;
+                border: none;
+                border-radius: 10px;
+            }
+            QFrame#goalSummaryActionBar {
+                background: #ecebe5;
+                border: none;
+                border-radius: 10px;
+            }
+            QPushButton#goalActionButton {
+                border: none;
+                background: transparent;
+                color: #252421;
+                padding: 10px 14px;
+                font-size: 14px;
+                font-weight: 500;
+            }
+            QPushButton#goalActionButton:hover {
+                background: #e2e0d8;
+            }
+            QPushButton#goalActionButtonPrimary {
+                border: none;
+                background: transparent;
+                color: #2b7a52;
+                padding: 10px 14px;
+                font-size: 14px;
+                font-weight: 600;
+            }
+            QPushButton#goalActionButtonPrimary:hover {
+                background: #deebe3;
+            }
+            QPushButton#goalDeleteAction {
+                border: none;
+                background: transparent;
+                color: #c23b31;
+                padding: 10px 14px;
+                font-size: 14px;
+                font-weight: 600;
+            }
+            QPushButton#goalDeleteAction:hover {
+                background: #f3dfdc;
+            }
+            QFrame#goalActionDivider {
+                background: #d7d5cc;
+                min-width: 1px;
+                max-width: 1px;
+            }
+            """
+        )
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        head = QHBoxLayout()
+        title_lbl = QLabel(goal_data["name"])
+        title_lbl.setStyleSheet('font-family: "Segoe UI"; font-size: 30px; font-weight: 700; color: #22211f;')
+        head.addWidget(title_lbl)
+        head.addStretch()
+        close_btn = QToolButton()
+        close_btn.setText("✕")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setStyleSheet("QToolButton { border: none; font-size: 16px; color: #6b6962; }")
+        close_btn.clicked.connect(dialog.reject)
+        head.addWidget(close_btn)
+        layout.addLayout(head)
+
+        amount_row = QHBoxLayout()
+        current_col = QVBoxLayout()
+        current_caption = QLabel("CURRENT")
+        current_caption.setStyleSheet("font-size: 12px; color: #6b6962; font-weight: 700; letter-spacing: 0.8px;")
+        current_val = QLabel(format_compact_inr(metrics["current_savings"]))
+        current_val.setStyleSheet('font-family: "Segoe UI"; font-size: 42px; font-weight: 700; color: #22211f;')
+        current_col.addWidget(current_caption)
+        current_col.addWidget(current_val)
+        amount_row.addLayout(current_col, 1)
+
+        target_col = QVBoxLayout()
+        target_caption = QLabel("TARGET")
+        target_caption.setStyleSheet("font-size: 12px; color: #6b6962; font-weight: 700; letter-spacing: 0.8px;")
+        target_caption.setAlignment(Qt.AlignRight)
+        target_val = QLabel(format_compact_inr(metrics["target_amount"]))
+        target_val.setStyleSheet('font-family: "Segoe UI"; font-size: 42px; font-weight: 700; color: #22211f;')
+        target_val.setAlignment(Qt.AlignRight)
+        target_col.addWidget(target_caption)
+        target_col.addWidget(target_val)
+        amount_row.addLayout(target_col, 1)
+        layout.addLayout(amount_row)
+
+        def add_progress(label: str, pct: float, color: str) -> None:
+            row = QHBoxLayout()
+            label_widget = QLabel(label)
+            label_widget.setStyleSheet("font-size: 12px; color: #6b6962;")
+            row.addWidget(label_widget)
+            row.addStretch()
+            pct_widget = QLabel(f"{pct:.1f}%")
+            pct_widget.setStyleSheet(f"font-size: 12px; color: {color}; font-weight: 700;")
+            row.addWidget(pct_widget)
+            layout.addLayout(row)
+
+            bar = QProgressBar()
+            bar.setRange(0, 1000)
+            bar.setValue(int(max(0, min(1000, round(pct * 10)))))
+            bar.setTextVisible(False)
+            bar.setFixedHeight(10)
+            bar.setStyleSheet(
+                "QProgressBar { border: none; border-radius: 5px; background: #e6e4dd; }"
+                f"QProgressBar::chunk {{ border-radius: 5px; background: {color}; }}"
+            )
+            layout.addWidget(bar)
+
+        add_progress("Savings progress", metrics["progress_pct"], "#2b7a52")
+        add_progress("Time elapsed", metrics["time_elapsed_pct"], "#8f8b80")
+
+        callout = QFrame()
+        callout.setObjectName("goalSummaryCallout")
+        if status == "ACHIEVED":
+            callout_bg = "#e3efe8"
+            callout_fg = "#2b7a52"
+            title_text = "✓ Achieved"
+            subtitle_text = "This goal has been marked as achieved."
+        elif status == "PAUSED":
+            callout_bg = "#f1ece2"
+            callout_fg = "#6b6962"
+            title_text = "⏸ Paused"
+            subtitle_text = "This goal is paused. Resume it to continue progress planning."
+        elif metrics["months_remaining"] <= 0 and metrics["progress_pct"] < 100:
+            callout_bg = "#fae9e6"
+            callout_fg = "#cc4b38"
+            title_text = "⚠ Behind schedule"
+            subtitle_text = "Target date passed before completion."
+        elif metrics["progress_pct"] + 5 >= metrics["time_elapsed_pct"]:
+            callout_bg = "#e3efe8"
+            callout_fg = "#2b7a52"
+            title_text = "✓ On track"
+            subtitle_text = (
+                f"Invest {format_compact_inr(metrics['monthly_needed'])}/mo at "
+                f"{metrics['expected_return_pct']:.1f}% p.a. to close remaining gap."
+            )
+        else:
+            callout_bg = "#fff1d6"
+            callout_fg = "#8a6100"
+            title_text = "△ At risk"
+            subtitle_text = (
+                f"Current pace is below timeline. Needed: {format_compact_inr(metrics['monthly_needed'])}/mo."
+            )
+        callout.setStyleSheet(
+            f"QFrame#goalSummaryCallout {{ background: {callout_bg}; }}"
+        )
+        callout_layout = QVBoxLayout(callout)
+        callout_layout.setContentsMargins(14, 12, 14, 12)
+        callout_layout.setSpacing(6)
+        callout_title = QLabel(title_text)
+        callout_title.setStyleSheet(f"font-size: 22px; font-weight: 700; color: {callout_fg};")
+        callout_layout.addWidget(callout_title)
+        callout_sub = QLabel(subtitle_text)
+        callout_sub.setWordWrap(True)
+        callout_sub.setStyleSheet("font-size: 16px; color: #3b3a36;")
+        callout_layout.addWidget(callout_sub)
+        layout.addWidget(callout)
+
+        info_grid = QGridLayout()
+        info_grid.setHorizontalSpacing(10)
+        info_grid.setVerticalSpacing(10)
+
+        def make_info_card(title: str, value: str, subtext: str) -> QFrame:
+            card = QFrame()
+            card.setObjectName("goalSummaryInfoCard")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 10, 12, 10)
+            card_layout.setSpacing(4)
+            title_lbl = QLabel(title)
+            title_lbl.setStyleSheet("font-size: 11px; color: #6b6962; font-weight: 700; letter-spacing: 0.6px;")
+            value_lbl = QLabel(value)
+            value_lbl.setStyleSheet('font-family: "Segoe UI"; font-size: 30px; font-weight: 700; color: #22211f;')
+            sub_lbl = QLabel(subtext)
+            sub_lbl.setStyleSheet("font-size: 12px; color: #6b6962;")
+            sub_lbl.setWordWrap(True)
+            card_layout.addWidget(title_lbl)
+            card_layout.addWidget(value_lbl)
+            card_layout.addWidget(sub_lbl)
+            return card
+
+        days_left = int(metrics["days_remaining"])
+        months_left = int(metrics["months_remaining"])
+        try:
+            target_date_display = datetime.strptime(goal_data["target_date"], "%Y-%m-%d").strftime("%d %b %Y")
+        except ValueError:
+            target_date_display = goal_data["target_date"]
+        info_grid.addWidget(
+            make_info_card(
+                "TARGET DATE",
+                target_date_display,
+                f"{days_left} day{'s' if days_left != 1 else ''} left",
+            ),
+            0,
+            0,
+        )
+        info_grid.addWidget(
+            make_info_card(
+                "REMAINING",
+                format_compact_inr(metrics["remaining_amount"]),
+                f"over {months_left} month{'s' if months_left != 1 else ''}",
+            ),
+            0,
+            1,
+        )
+        info_grid.addWidget(
+            make_info_card(
+                "MONTHLY NEEDED",
+                format_compact_inr(metrics["monthly_needed"]),
+                f"at {metrics['expected_return_pct']:.1f}% p.a. assumed",
+            ),
+            1,
+            0,
+        )
+        info_grid.addWidget(
+            make_info_card(
+                "LINKED TO",
+                tracking_label,
+                "specific assets" if goal_data.get("linked_asset_ids") else "asset class",
+            ),
+            1,
+            1,
+        )
+        layout.addLayout(info_grid)
+
+        action_bar = QFrame()
+        action_bar.setObjectName("goalSummaryActionBar")
+        actions = QHBoxLayout(action_bar)
+        actions.setContentsMargins(8, 6, 8, 6)
+        actions.setSpacing(0)
+
+        def add_action_divider() -> None:
+            divider = QFrame()
+            divider.setObjectName("goalActionDivider")
+            divider.setFixedHeight(24)
+            actions.addWidget(divider)
+
+        edit_btn = QPushButton("Edit Goal")
+        edit_btn.setObjectName("goalActionButton")
+        edit_btn.setCursor(Qt.PointingHandCursor)
+        actions.addWidget(edit_btn)
+
+        if status != "ACHIEVED":
+            add_action_divider()
+            mark_btn = QPushButton("Mark Achieved")
+            mark_btn.setObjectName("goalActionButtonPrimary")
+            mark_btn.setCursor(Qt.PointingHandCursor)
+            actions.addWidget(mark_btn)
+
+            add_action_divider()
+            pause_resume_btn = QPushButton("Resume" if status == "PAUSED" else "Pause")
+            pause_resume_btn.setObjectName("goalActionButton")
+            pause_resume_btn.setCursor(Qt.PointingHandCursor)
+            actions.addWidget(pause_resume_btn)
+        else:
+            mark_btn = None
+            pause_resume_btn = None
+
+        add_action_divider()
+        delete_btn = QPushButton("Delete")
+        delete_btn.setObjectName("goalDeleteAction")
+        delete_btn.setCursor(Qt.PointingHandCursor)
+        actions.addWidget(delete_btn)
+        layout.addWidget(action_bar)
+
+        def open_edit() -> None:
+            dialog.accept()
+            self._open_goal_edit_dialog(goal_id)
+
+        def mark_achieved() -> None:
+            dialog.accept()
+            self._set_goal_status(goal_id, "ACHIEVED", "Goal marked achieved")
+
+        def toggle_pause_resume() -> None:
+            dialog.accept()
+            if status == "PAUSED":
+                self._set_goal_status(goal_id, "ACTIVE", "Goal resumed")
+            else:
+                self._set_goal_status(goal_id, "PAUSED", "Goal paused")
+
+        def delete_goal_action() -> None:
+            if self._confirm_goal_delete(goal_data):
+                dialog.accept()
+
+        edit_btn.clicked.connect(open_edit)
+        delete_btn.clicked.connect(delete_goal_action)
+        if mark_btn is not None:
+            mark_btn.clicked.connect(mark_achieved)
+        if pause_resume_btn is not None:
+            pause_resume_btn.clicked.connect(toggle_pause_resume)
+
+        dialog.exec()
+
+
+
+    # ─────────────────────────────────────────────
+    # DASHBOARD PAGE
+    # ─────────────────────────────────────────────
+
+    def _show_dashboard_page(self) -> None:
+        self._refresh_dashboard_view()
+        self._set_active_nav_item("Dashboard")
+        self.content_stack.setCurrentIndex(self.DASHBOARD_PAGE_INDEX)
+
+    def _build_dashboard_page(self) -> QWidget:
+        """Build the static skeleton for the Dashboard overview page."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { border: none; background: #f7f7f5; }")
+
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        root = QVBoxLayout(container)
+        root.setContentsMargins(28, 22, 28, 24)
+        root.setSpacing(16)
+
+        # ── Row 1: Net Worth hero card ────────────────────────────────────
+        hero_card = QFrame()
+        hero_card.setObjectName("dashHeroCard")
+        hero_card.setStyleSheet(
+            """
+            QFrame#dashHeroCard {
+                background: #ffffff;
+                border: 1px solid #d9d8d3;
+                border-radius: 12px;
+            }
+            """
+        )
+        hero_card.setFixedHeight(240)
+        hero_hl = QHBoxLayout(hero_card)
+        hero_hl.setContentsMargins(28, 18, 28, 18)
+        hero_hl.setSpacing(24)
+
+        # Left: net-worth value block — centered
+        nw_col = QVBoxLayout()
+        nw_col.setSpacing(4)
+        nw_col.setAlignment(Qt.AlignHCenter)
+
+        self.dash_nw_label = QLabel("NET WORTH · ₹ INR")
+        self.dash_nw_label.setAlignment(Qt.AlignCenter)
+        self.dash_nw_label.setStyleSheet(
+            "font-size: 11px; font-weight: 700; color: #6b6962;"
+            " letter-spacing: 0.8px;"
+        )
+        nw_col.addWidget(self.dash_nw_label)
+
+        self.dash_nw_value = QLabel("₹0")
+        self.dash_nw_value.setAlignment(Qt.AlignCenter)
+        self.dash_nw_value.setStyleSheet(
+            "font-size: 84px; font-weight: 800; color: #1d7a4f;"
+        )
+        nw_col.addWidget(self.dash_nw_value)
+
+        self.dash_nw_delta = QLabel("+₹0 (+0.0%) vs last snapshot")
+        self.dash_nw_delta.setAlignment(Qt.AlignCenter)
+        self.dash_nw_delta.setStyleSheet("font-size: 13px; color: #2b7a52;")
+        nw_col.addWidget(self.dash_nw_delta)
+
+        # Sparkline chart (compact, inline below delta)
+        self.dash_sparkline_view = QChartView()
+        self.dash_sparkline_view.setObjectName("timelineChart")
+        self.dash_sparkline_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.dash_sparkline_view.setFixedSize(260, 60)
+        self.dash_sparkline_view.setStyleSheet("background: transparent; border: none;")
+
+        spark_chart = QChart()
+        spark_chart.setBackgroundBrush(Qt.transparent)
+        spark_chart.setBackgroundVisible(False)
+        spark_chart.setPlotAreaBackgroundVisible(False)
+        spark_chart.legend().setVisible(False)
+        spark_chart.setMargins(QMargins(0, 0, 0, 0))
+        self.dash_spark_series = QLineSeries()
+        pen = QPen(QColor("#2b7a52"))
+        pen.setWidth(2)
+        self.dash_spark_series.setPen(pen)
+        spark_chart.addSeries(self.dash_spark_series)
+        spark_chart.createDefaultAxes()
+        for axis in spark_chart.axes():
+            axis.setVisible(False)
+        self.dash_sparkline_view.setChart(spark_chart)
+        self.dash_spark_chart = spark_chart
+
+        nw_col.addWidget(self.dash_sparkline_view, 0, Qt.AlignHCenter)
+
+        nw_outer = QVBoxLayout()
+        nw_outer.setContentsMargins(0, 0, 0, 0)
+        nw_outer.setSpacing(0)
+        nw_outer.addStretch()
+        nw_outer.addLayout(nw_col)
+        nw_outer.addStretch()
+
+        hero_hl.addLayout(nw_outer, 3)
+
+        # Divider
+        divider = QFrame()
+        divider.setFrameShape(QFrame.VLine)
+        divider.setStyleSheet("color: #e5e4df;")
+        hero_hl.addWidget(divider)
+
+        # Right: 2×2 grid of colorful mini metric tiles (no inner boxes)
+        mini_grid = QGridLayout()
+        mini_grid.setSpacing(10)
+
+        def make_mini_tile(bg: str, label_text: str, accent: str) -> tuple[QFrame, QLabel, QLabel, QLabel]:
+            tile = QFrame()
+            tile.setStyleSheet(
+                f"QFrame {{ background: {bg}; border: none; border-radius: 10px; }}"
+            )
+            tile.setFixedSize(210, 74)
+            tl = QVBoxLayout(tile)
+            tl.setContentsMargins(14, 10, 14, 10)
+            tl.setSpacing(2)
+            lbl = QLabel(label_text)
+            lbl.setStyleSheet(
+                f"font-size: 10px; font-weight: 700; color: {accent};"
+                f" letter-spacing: 0.7px; background: transparent;"
+            )
+            val = QLabel("₹0")
+            val.setStyleSheet(
+                f"font-size: 19px; font-weight: 800; color: {accent}; background: transparent;"
+            )
+            sub = QLabel("–")
+            sub.setStyleSheet(f"font-size: 11px; color: {accent}; opacity: 0.75; background: transparent;")
+            tl.addWidget(lbl)
+            tl.addWidget(val)
+            tl.addWidget(sub)
+            return tile, lbl, val, sub
+
+        assets_tile, _, self.dash_assets_value, self.dash_assets_sub = make_mini_tile(
+            "#dbeafe", "ASSETS", "#1e40af"
+        )
+        liab_tile, _, self.dash_liab_value, self.dash_liab_sub = make_mini_tile(
+            "#fee2e2", "LIABILITIES", "#991b1b"
+        )
+        inv_tile, _, self.dash_inv_value, self.dash_inv_sub = make_mini_tile(
+            "#dcfce7", "INVESTED", "#166534"
+        )
+
+        # Health Score tile — with hover tooltip
+        health_tile = QFrame()
+        health_tile.setStyleSheet(
+            "QFrame { background: #ede9fe; border: none; border-radius: 10px; }"
+        )
+        health_tile.setFixedSize(210, 74)
+        htl = QVBoxLayout(health_tile)
+        htl.setContentsMargins(14, 10, 14, 10)
+        htl.setSpacing(2)
+        h_lbl = QLabel("HEALTH SCORE")
+        h_lbl.setStyleSheet(
+            "font-size: 10px; font-weight: 700; color: #5b21b6;"
+            " letter-spacing: 0.7px; background: transparent;"
+        )
+        self.dash_health_value = QLabel("–")
+        self.dash_health_value.setStyleSheet(
+            "font-size: 19px; font-weight: 800; color: #5b21b6; background: transparent;"
+        )
+        self.dash_health_sub = QLabel("–")
+        self.dash_health_sub.setStyleSheet(
+            "font-size: 11px; color: #5b21b6; background: transparent;"
+        )
+        htl.addWidget(h_lbl)
+        htl.addWidget(self.dash_health_value)
+        htl.addWidget(self.dash_health_sub)
+
+        # Tooltip popup for health score
+        self._health_tooltip = QFrame(None, Qt.ToolTip)
+        self._health_tooltip.setWindowFlags(Qt.ToolTip)
+        self._health_tooltip.setStyleSheet(
+            "QFrame { background: #1e1b2e; border-radius: 8px; padding: 4px; }"
+            " QLabel { color: #e9d5ff; font-size: 12px; background: transparent; }"
+        )
+        tt_layout = QVBoxLayout(self._health_tooltip)
+        tt_layout.setContentsMargins(12, 10, 12, 10)
+        tt_layout.setSpacing(4)
+        self._health_tooltip_title = QLabel("Health Score Breakdown")
+        self._health_tooltip_title.setStyleSheet(
+            "font-weight: 700; font-size: 13px; color: #f3e8ff; background: transparent;"
+        )
+        tt_layout.addWidget(self._health_tooltip_title)
+        self._health_tooltip_body = QLabel("")
+        self._health_tooltip_body.setWordWrap(True)
+        self._health_tooltip_body.setStyleSheet(
+            "color: #c4b5fd; font-size: 12px; line-height: 1.5; background: transparent;"
+        )
+        tt_layout.addWidget(self._health_tooltip_body)
+        self._health_tooltip.hide()
+
+        def health_enter(event):
+            pos = health_tile.mapToGlobal(health_tile.rect().bottomLeft())
+            self._health_tooltip.move(pos)
+            self._health_tooltip.adjustSize()
+            self._health_tooltip.show()
+            self._health_tooltip.raise_()
+
+        def health_leave(event):
+            self._health_tooltip.hide()
+
+        health_tile.enterEvent = health_enter
+        health_tile.leaveEvent = health_leave
+
+        mini_grid.addWidget(assets_tile, 0, 0)
+        mini_grid.addWidget(liab_tile, 0, 1)
+        mini_grid.addWidget(inv_tile, 1, 0)
+        mini_grid.addWidget(health_tile, 1, 1)
+
+        hero_hl.addLayout(mini_grid, 1)
+        root.addWidget(hero_card)
+
+
+        # ── Bottom row: Asset Allocation | Top Holdings | Goals ──────────
+        bottom_hl = QHBoxLayout()
+        bottom_hl.setSpacing(16)
+
+        # --- Asset Allocation card ---
+        alloc_card = QFrame()
+        alloc_card.setObjectName("dashAllocCard")
+        alloc_card.setStyleSheet(
+            "QFrame#dashAllocCard { background: #ffffff; border: 1px solid #d9d8d3; border-radius: 12px; }"
+        )
+        alloc_vl = QVBoxLayout(alloc_card)
+        alloc_vl.setContentsMargins(18, 14, 18, 14)
+        alloc_vl.setSpacing(8)
+
+        alloc_title_lbl = QLabel("Asset Allocation")
+        alloc_title_lbl.setStyleSheet("font-size: 15px; font-weight: 700; color: #22211f;")
+        alloc_sub_lbl = QLabel("By category")
+        alloc_sub_lbl.setStyleSheet("font-size: 11px; color: #6b6962;")
+        alloc_vl.addWidget(alloc_title_lbl)
+        alloc_vl.addWidget(alloc_sub_lbl)
+
+        alloc_inner_hl = QHBoxLayout()
+        alloc_inner_hl.setSpacing(12)
+
+        class DonutWidget(QWidget):
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                # data: list of (label, pct, color, value_inr)
+                self._data: list[tuple[str, float, str, float]] = []
+                self._total_label: str = ""
+                self._hovered: int = -1  # index of hovered segment
+                self.setFixedSize(168, 168)
+                self.setMouseTracking(True)
+
+            def set_data(self, data: list[tuple[str, float, str, float]], total_label: str):
+                self._data = data
+                self._total_label = total_label
+                self._hovered = -1
+                self.update()
+
+            def _center(self) -> tuple[float, float]:
+                return self.width() / 2.0, self.height() / 2.0
+
+            def _ring_geometry(self) -> tuple[float, float, float, float]:
+                # Keep enough inner/outer margin so hover strokes don't clip.
+                base_radius = min(self.width(), self.height()) * 0.315
+                hover_radius = base_radius + 2.0
+                base_pen = 16.0
+                hover_pen = 20.0
+                return base_radius, hover_radius, base_pen, hover_pen
+
+            def _angle_from_center(self, x: float, y: float) -> float:
+                """Return angle in degrees 0-360 measured clockwise from 12 o'clock."""
+                import math
+                cx, cy = self._center()
+                dx, dy = x - cx, y - cy
+                # atan2 gives angle from +x axis; convert to clockwise from +y (12 o'clock)
+                angle = math.degrees(math.atan2(dx, -dy)) % 360
+                return angle
+
+            def _segment_at(self, x: float, y: float) -> int:
+                """Return segment index under (x,y), or -1 if not over the ring."""
+                import math
+                cx, cy = self._center()
+                base_radius, hover_radius, base_pen, hover_pen = self._ring_geometry()
+                dist = math.hypot(x - cx, y - cy)
+                inner_radius = max(0.0, base_radius - (base_pen / 2.0) - 6.0)
+                outer_radius = hover_radius + (hover_pen / 2.0) + 2.0
+                if dist < inner_radius or dist > outer_radius:
+                    return -1
+                angle = self._angle_from_center(x, y)
+                cum = 0.0
+                for i, (label, pct, color, val) in enumerate(self._data):
+                    cum += pct * 360 / 100
+                    if angle < cum:
+                        return i
+                return -1
+
+            def mouseMoveEvent(self, event):
+                idx = self._segment_at(event.position().x(), event.position().y())
+                if idx != self._hovered:
+                    self._hovered = idx
+                    self.update()
+
+            def leaveEvent(self, event):
+                self._hovered = -1
+                self.update()
+
+            def paintEvent(self, event):
+                from PySide6.QtGui import QPainter, QColor, QPen, QFont
+                from PySide6.QtCore import QRectF
+                painter = QPainter(self)
+                painter.setRenderHint(QPainter.Antialiasing)
+                cx, cy = self._center()
+                base_radius, hover_radius, base_pen, hover_pen = self._ring_geometry()
+                rect = QRectF(cx - base_radius, cy - base_radius, base_radius * 2.0, base_radius * 2.0)
+                rect_highlight = QRectF(
+                    cx - hover_radius,
+                    cy - hover_radius,
+                    hover_radius * 2.0,
+                    hover_radius * 2.0,
+                )
+                start_angle = 90 * 16
+                total_pct = sum(d[1] for d in self._data)
+
+                if total_pct <= 0:
+                    painter.setPen(QPen(QColor("#e5e4df"), base_pen))
+                    painter.drawArc(rect, 0, 360 * 16)
+                else:
+                    for i, (label, pct, color, val) in enumerate(self._data):
+                        span = int((pct / 100.0) * 360 * 16)
+                        is_hovered = (i == self._hovered)
+                        c = QColor(color)
+                        if is_hovered:
+                            # Use larger rect + slightly brighter color + thicker stroke
+                            c = c.lighter(115)
+                            painter.setPen(QPen(c, hover_pen))
+                            painter.drawArc(rect_highlight, start_angle, -span)
+                        else:
+                            alpha = 180 if self._hovered != -1 else 255  # dim non-hovered
+                            c.setAlpha(alpha)
+                            painter.setPen(QPen(c, base_pen))
+                            painter.drawArc(rect, start_angle, -span)
+                        start_angle -= span
+
+                # Center text
+                text_width = min(self.width() * 0.76, 130.0)
+                text_x = cx - (text_width / 2.0)
+                if self._hovered >= 0 and self._hovered < len(self._data):
+                    label, pct, color, val = self._data[self._hovered]
+                    from app import format_compact_inr as _fmt
+                    painter.setPen(QColor(color))
+                    f = QFont("Segoe UI", 7, QFont.Bold)
+                    painter.setFont(f)
+                    # Wrap long category names
+                    painter.drawText(
+                        QRectF(text_x, cy - 38.0, text_width, 20.0),
+                        Qt.AlignCenter | Qt.TextWordWrap,
+                        label,
+                    )
+                    painter.setPen(QColor("#22211f"))
+                    f2 = QFont("Segoe UI", 8, QFont.Bold)
+                    painter.setFont(f2)
+                    painter.drawText(QRectF(text_x, cy - 16.0, text_width, 20.0), Qt.AlignCenter, _fmt(val))
+                    painter.setPen(QColor("#6b6962"))
+                    f3 = QFont("Segoe UI", 7)
+                    painter.setFont(f3)
+                    painter.drawText(QRectF(text_x, cy + 2.0, text_width, 18.0), Qt.AlignCenter, f"{pct:.0f}% of portfolio")
+                else:
+                    painter.setPen(QColor("#22211f"))
+                    f = QFont("Segoe UI", 8, QFont.Bold)
+                    painter.setFont(f)
+                    painter.drawText(QRectF(text_x, cy - 20.0, text_width, 22.0), Qt.AlignCenter, self._total_label)
+                    f2 = QFont("Segoe UI", 7)
+                    painter.setFont(f2)
+                    painter.setPen(QColor("#6b6962"))
+                    painter.drawText(QRectF(text_x, cy - 2.0, text_width, 16.0), Qt.AlignCenter, "TOTAL (INR)")
+                painter.end()
+
+        self.dash_donut = DonutWidget()
+        alloc_inner_hl.addWidget(self.dash_donut)
+
+        self.dash_alloc_legend_layout = QVBoxLayout()
+        self.dash_alloc_legend_layout.setSpacing(4)
+        self.dash_alloc_legend_layout.addStretch()
+        alloc_inner_hl.addLayout(self.dash_alloc_legend_layout, 1)
+
+        # Don't add to bottom_hl here — added later in mid_hl
+
+        alloc_vl.addLayout(alloc_inner_hl)
+        alloc_vl.addStretch()
+
+        # --- Top Holdings card ---
+        holdings_card = QFrame()
+        holdings_card.setObjectName("dashHoldCard")
+        holdings_card.setStyleSheet(
+            "QFrame#dashHoldCard { background: #ffffff; border: 1px solid #d9d8d3; border-radius: 12px; }"
+        )
+        holdings_vl = QVBoxLayout(holdings_card)
+        holdings_vl.setContentsMargins(20, 16, 20, 16)
+        holdings_vl.setSpacing(12)
+
+        hold_header = QHBoxLayout()
+        hold_title = QLabel("Top Holdings")
+        hold_title.setStyleSheet("font-size: 15px; font-weight: 700; color: #22211f;")
+        hold_header.addWidget(hold_title)
+        hold_header.addStretch()
+        hold_view_all = QLabel("View all →")
+        hold_view_all.setStyleSheet("font-size: 12px; color: #2b7a52;")
+        hold_header.addWidget(hold_view_all)
+        holdings_vl.addLayout(hold_header)
+
+        self.dash_holdings_grid = QGridLayout()
+        self.dash_holdings_grid.setSpacing(10)
+        holdings_vl.addLayout(self.dash_holdings_grid)
+        # holdings_card added to mid_hl below
+
+        # --- Goals Tracking card ---
+        goals_track_card = QFrame()
+        goals_track_card.setObjectName("dashGoalsCard")
+        goals_track_card.setStyleSheet(
+            "QFrame#dashGoalsCard { background: #ffffff; border: 1px solid #d9d8d3; border-radius: 12px; }"
+        )
+        goals_vl = QVBoxLayout(goals_track_card)
+        goals_vl.setContentsMargins(20, 16, 20, 16)
+        goals_vl.setSpacing(10)
+
+        goals_header = QHBoxLayout()
+        goals_title = QLabel("Goals")
+        goals_title.setStyleSheet("font-size: 15px; font-weight: 700; color: #22211f;")
+        goals_header.addWidget(goals_title)
+        goals_header.addStretch()
+        goals_manage = QLabel("Manage →")
+        goals_manage.setStyleSheet("font-size: 12px; color: #2b7a52;")
+        goals_header.addWidget(goals_manage)
+        goals_vl.addLayout(goals_header)
+
+        self.dash_goals_vl = QVBoxLayout()
+        self.dash_goals_vl.setSpacing(8)
+        goals_vl.addLayout(self.dash_goals_vl)
+        goals_vl.addStretch()
+
+        root.addWidget(hero_card)
+
+        # ── Row 2: Asset Allocation | Top Holdings (equal columns) ─────────
+        mid_hl = QHBoxLayout()
+        mid_hl.setSpacing(16)
+        mid_hl.addWidget(alloc_card, 1)
+        mid_hl.addWidget(holdings_card, 1)
+        root.addLayout(mid_hl)
+
+        # ── Row 3: Goals (same width as Asset Allocation = left half) ──────
+        goals_hl = QHBoxLayout()
+        goals_hl.setSpacing(16)
+        goals_hl.addWidget(goals_track_card, 1)
+        goals_hl.addStretch(1)  # mirror the right column gap
+        root.addLayout(goals_hl)
+
+        root.addStretch()
+
+
+
+        scroll.setWidget(container)
+        return scroll
+
+    def _refresh_dashboard_view(self) -> None:
+        """Populate all dynamic labels in the Dashboard page from live DB data."""
+        # Guard: dashboard widgets may not exist yet during first call
+        if not hasattr(self, "dash_nw_value"):
+            return
+
+        from db import fetch_goals  # local import (may not exist if goals not seeded)
+
+        assets = fetch_assets()
+        liabilities = fetch_liabilities()
+        snapshots = fetch_net_worth_snapshots(limit=10)
+        exchange_rates: dict[str, float] = fetch_exchange_rates()  # already dict[str, float]
+
+        # ── Compute totals ──────────────────────────────────────────────
+        def to_inr(value: float, currency: str) -> float:
+            rate = exchange_rates.get(normalize_currency(currency), 1.0)
+            return value * rate
+
+        total_assets_inr = sum(to_inr(float(a["value"]), a["currency"]) for a in assets)
+        total_invested_inr = sum(to_inr(float(a["invested"]), a["currency"]) for a in assets)
+        total_liab_inr = sum(to_inr(float(lb["outstanding_amount"]), lb["currency"]) for lb in liabilities)
+        net_worth_inr = total_assets_inr - total_liab_inr
+        pnl_pct = calculate_change_pct(total_invested_inr, total_assets_inr)
+
+        asset_count = len(assets)
+        liab_count = len(liabilities)
+
+        # ── Net Worth card ──────────────────────────────────────────────
+        self.dash_nw_value.setText(format_compact_inr(net_worth_inr))
+
+        # Delta vs last snapshot
+        if len(snapshots) >= 2:
+            latest = float(snapshots[0]["net_worth_inr"])
+            prev = float(snapshots[1]["net_worth_inr"])
+            delta = latest - prev
+            delta_pct = (delta / prev * 100) if prev != 0 else 0
+            sign = "+" if delta >= 0 else ""
+            color = "#2b7a52" if delta >= 0 else "#c23b31"
+            self.dash_nw_delta.setText(
+                f"{sign}{format_compact_inr(delta)} ({sign}{delta_pct:.1f}%) vs last snapshot"
+            )
+            self.dash_nw_delta.setStyleSheet(f"font-size: 12px; color: {color};")
+        elif len(snapshots) == 1:
+            self.dash_nw_delta.setText("No previous snapshot to compare")
+            self.dash_nw_delta.setStyleSheet("font-size: 12px; color: #6b6962;")
+        else:
+            self.dash_nw_delta.setText("No snapshots recorded yet")
+            self.dash_nw_delta.setStyleSheet("font-size: 12px; color: #6b6962;")
+
+        # ── Sparkline ───────────────────────────────────────────────────
+        self.dash_spark_series.clear()
+        snap_list = list(reversed(snapshots))  # oldest → newest
+        if len(snap_list) >= 2:
+            for i, s in enumerate(snap_list):
+                self.dash_spark_series.append(float(i), float(s["net_worth_inr"]))
+            self.dash_spark_chart.createDefaultAxes()
+            for axis in self.dash_spark_chart.axes():
+                axis.setVisible(False)
+        elif len(snap_list) == 1:
+            # Single point – flat line
+            v = float(snap_list[0]["net_worth_inr"])
+            self.dash_spark_series.append(0, v)
+            self.dash_spark_series.append(1, v)
+
+        # ── Mini tiles ─────────────────────────────────────────────────
+        self.dash_assets_value.setText(format_compact_inr(total_assets_inr))
+        self.dash_assets_sub.setText(f"{asset_count_label(asset_count)}")
+
+        self.dash_liab_value.setText(format_compact_inr(total_liab_inr))
+        active_loans = sum(1 for lb in liabilities if float(lb["outstanding_amount"] or 0) > 0)
+        self.dash_liab_sub.setText(f"{active_loans} active loan{'s' if active_loans != 1 else ''}")
+
+        self.dash_inv_value.setText(format_compact_inr(total_invested_inr))
+        pnl_sign = "+" if pnl_pct >= 0 else ""
+        self.dash_inv_sub.setText(f"{pnl_sign}{pnl_pct:.1f}% ({pnl_sign}{format_compact_inr(total_assets_inr - total_invested_inr)})")
+
+        # ── Health Score: multi-factor model (0–10) ────────────────────
+        # Factor 1: Net Worth Ratio  (net worth / assets)  → max 2 pts
+        if total_assets_inr > 0:
+            nw_ratio = net_worth_inr / total_assets_inr  # 1.0 = no debt
+            f1 = min(2.0, max(0.0, nw_ratio * 2.0))
+            f1_note = f"Net worth / assets = {nw_ratio*100:.0f}%"
+        else:
+            f1 = 0.0
+            f1_note = "No assets recorded"
+
+        # Factor 2: Diversification  (number of distinct categories)  → max 2 pts
+        cat_keys_present: set[str] = set()
+        for a in assets:
+            ck = a["class_key"]
+            cl2 = self.class_lookup.get(ck)
+            try:
+                cat_keys_present.add(cl2["category_key"] if cl2 else "OTHER")
+            except (KeyError, IndexError):
+                cat_keys_present.add("OTHER")
+        num_cats = len(cat_keys_present)
+        f2 = min(2.0, num_cats * 0.5)
+        f2_note = f"{num_cats} asset categor{'y' if num_cats == 1 else 'ies'} held"
+
+        # Factor 3: Debt-to-Assets (lower is better)  → max 2 pts
+        if total_assets_inr > 0:
+            dta = total_liab_inr / total_assets_inr
+            f3 = min(2.0, max(0.0, (1.0 - dta) * 2.0))
+            f3_note = f"Debt-to-assets = {dta*100:.0f}%"
+        else:
+            f3 = 2.0 if total_liab_inr == 0 else 0.0
+            f3_note = "No assets to compare debt against"
+
+        # Factor 4: Returns (P&L %)  → max 2 pts
+        if pnl_pct >= 15:
+            f4 = 2.0
+        elif pnl_pct >= 5:
+            f4 = 1.0 + (pnl_pct - 5) / 10.0
+        elif pnl_pct >= 0:
+            f4 = pnl_pct / 5.0
+        else:
+            f4 = max(0.0, 1.0 + pnl_pct / 10.0)
+        f4 = round(min(2.0, max(0.0, f4)), 2)
+        f4_note = f"Portfolio P&L = {pnl_pct:+.1f}%"
+
+        # Factor 5: Asset base (at least ≥ 3 assets = good habit)  → max 2 pts
+        f5 = min(2.0, asset_count * 0.4)
+        f5_note = f"{asset_count} asset{'s' if asset_count != 1 else ''} tracked"
+
+        hs = round(f1 + f2 + f3 + f4 + f5, 1)
+
+        if hs >= 8:
+            hs_label = "Excellent 🏆"
+        elif hs >= 6:
+            hs_label = "Good shape"
+        elif hs >= 4:
+            hs_label = "Fair"
+        else:
+            hs_label = "Needs attention"
+
+        self.dash_health_value.setText(f"{hs:.1f}/10")
+        self.dash_health_sub.setText(hs_label)
+
+        # Update tooltip breakdown
+        if hasattr(self, "_health_tooltip_body"):
+            breakdown = (
+                f"① Net worth ratio:   {f1:.1f}/2  — {f1_note}\n"
+                f"② Diversification:    {f2:.1f}/2  — {f2_note}\n"
+                f"③ Debt-to-assets:    {f3:.1f}/2  — {f3_note}\n"
+                f"④ Portfolio returns: {f4:.1f}/2  — {f4_note}\n"
+                f"⑤ Asset breadth:     {f5:.1f}/2  — {f5_note}"
+            )
+            self._health_tooltip_body.setText(breakdown)
+            self._health_tooltip_body.setMinimumWidth(340)
+
+
+
+        # ── Asset Allocation donut ──────────────────────────────────────
+        CATEGORY_COLORS: dict[str, str] = {
+            "REAL_ESTATE": "#b5860a",
+            "DEBT": "#2b7a52",
+            "EQUITY": "#256d46",
+            "GOLD_SILVER": "#c49a0a",
+            "CRYPTO": "#5b6dcd",
+            "CASH": "#4a90d9",
+            "INSURANCE": "#8e8680",
+            "ALTERNATIVES": "#9c6b9e",
+            "OTHER_COMMODITIES": "#c2784f",
+        }
+
+        cat_totals: dict[str, float] = {}
+        for a in assets:
+            class_key = a["class_key"]
+            # find category for this class via class_lookup (sqlite3.Row)
+            cl = self.class_lookup.get(class_key)  # dict key lookup is fine
+            try:
+                cat_key = cl["category_key"] if cl is not None else "OTHER"
+            except (IndexError, KeyError):
+                cat_key = "OTHER"
+            val_inr = to_inr(float(a["value"]), a["currency"])
+            cat_totals[cat_key] = cat_totals.get(cat_key, 0.0) + val_inr
+
+        sorted_cats = sorted(cat_totals.items(), key=lambda x: x[1], reverse=True)
+        donut_data: list[tuple[str, float, str]] = []
+        for cat_key, val in sorted_cats:
+            pct = (val / total_assets_inr * 100) if total_assets_inr > 0 else 0
+            cat_name = self.category_lookup.get(cat_key, cat_key.replace("_", " ").title())
+            color = CATEGORY_COLORS.get(cat_key, "#aaa")
+            donut_data.append((cat_name, pct, color, val))  # include raw value for hover
+
+        self.dash_donut.set_data(donut_data, format_compact_inr(total_assets_inr))
+
+        # Rebuild legend
+        for i in reversed(range(self.dash_alloc_legend_layout.count())):
+            item = self.dash_alloc_legend_layout.itemAt(i)
+            if item and item.widget():
+                item.widget().setParent(None)
+
+        for cat_name, pct, color, _val in donut_data:
+            row_w = QWidget()
+            row_l = QHBoxLayout(row_w)
+            row_l.setContentsMargins(0, 0, 0, 0)
+            row_l.setSpacing(6)
+
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color: {color}; font-size: 14px;")
+            row_l.addWidget(dot)
+
+            name_lbl = QLabel(cat_name)
+            name_lbl.setStyleSheet("font-size: 12px; color: #3a3936;")
+            row_l.addWidget(name_lbl)
+            row_l.addStretch()
+
+            pct_lbl = QLabel(f"{pct:.0f}%")
+            pct_lbl.setStyleSheet("font-size: 12px; font-weight: 700; color: #22211f;")
+            row_l.addWidget(pct_lbl)
+
+            self.dash_alloc_legend_layout.addWidget(row_w)
+
+        self.dash_alloc_legend_layout.addStretch()
+
+        # ── Top Holdings ────────────────────────────────────────────────
+        # Clear previous
+        for i in reversed(range(self.dash_holdings_grid.count())):
+            item = self.dash_holdings_grid.itemAt(i)
+            if item and item.widget():
+                item.widget().setParent(None)
+
+        sorted_assets = sorted(assets, key=lambda a: to_inr(float(a["value"]), a["currency"]), reverse=True)
+        top4 = sorted_assets[:4]
+
+        ASSET_CLASS_COLORS: dict[str, str] = {
+            "REAL_ESTATE": "#f0e6c8",
+            "STOCKS_EQUITY": "#d6ede2",
+            "MUTUAL_FUNDS": "#d6ede2",
+            "FD_RD": "#c8dff0",
+            "BONDS": "#c8dff0",
+            "DEBT_FUNDS": "#c8dff0",
+            "GOLD_SILVER": "#f5ebc0",
+            "CRYPTO": "#ddd4f5",
+            "INTERNATIONAL": "#d6ede2",
+        }
+        ASSET_CLASS_TEXT_COLORS: dict[str, str] = {
+            "REAL_ESTATE": "#7a5c0a",
+            "STOCKS_EQUITY": "#1d5c3a",
+            "MUTUAL_FUNDS": "#1d5c3a",
+            "FD_RD": "#0a3d6b",
+            "BONDS": "#0a3d6b",
+            "DEBT_FUNDS": "#0a3d6b",
+            "GOLD_SILVER": "#7a5c0a",
+            "CRYPTO": "#3d1d7a",
+            "INTERNATIONAL": "#1d5c3a",
+        }
+
+        for idx, asset in enumerate(top4):
+            row = idx // 2
+            col = idx % 2
+            tile = QFrame()
+            tile.setStyleSheet(
+                "QFrame { background: #f9f9f7; border: 1px solid #e5e4df; border-radius: 10px; }"
+            )
+            tile.setFixedHeight(80)
+            tl = QVBoxLayout(tile)
+            tl.setContentsMargins(12, 10, 12, 10)
+            tl.setSpacing(4)
+
+            name_lbl = QLabel(asset["name"] or "–")
+            name_lbl.setStyleSheet("font-size: 13px; font-weight: 600; color: #22211f; border: none;")
+            name_lbl.setWordWrap(False)
+            tl.addWidget(name_lbl)
+
+            val_inr = to_inr(float(asset["value"]), asset["currency"])
+            val_lbl = QLabel(format_compact_inr(val_inr))
+            val_lbl.setStyleSheet("font-size: 16px; font-weight: 700; color: #22211f; border: none;")
+            tl.addWidget(val_lbl)
+
+            class_key = asset["class_key"] if "class_key" in asset.keys() else ""
+            class_info = self.class_lookup.get(class_key)  # sqlite3.Row or None
+            if class_info is not None:
+                try:
+                    class_label = class_info["class_name"]
+                except (IndexError, KeyError):
+                    class_label = class_key.replace("_", " ").title()
+            else:
+                class_label = class_key.replace("_", " ").title() if class_key else "–"
+            badge_bg = ASSET_CLASS_COLORS.get(class_key, "#e8e7e3")
+            badge_fg = ASSET_CLASS_TEXT_COLORS.get(class_key, "#5a5853")
+            badge_lbl = QLabel(class_label)
+            badge_lbl.setStyleSheet(
+                f"font-size: 10px; font-weight: 600; color: {badge_fg};"
+                f" background: {badge_bg}; border-radius: 4px; padding: 2px 6px; border: none;"
+            )
+            badge_lbl.setFixedHeight(18)
+            tl.addWidget(badge_lbl)
+
+            self.dash_holdings_grid.addWidget(tile, row, col)
+
+        # ── Goals Tracking ─────────────────────────────────────────────
+        for i in reversed(range(self.dash_goals_vl.count())):
+            item = self.dash_goals_vl.itemAt(i)
+            if item and item.widget():
+                item.widget().setParent(None)
+
+        try:
+            from db import fetch_goals
+            goals = fetch_goals()
+        except Exception:
+            goals = []
+
+        if not goals:
+            no_goals = QLabel("No goals yet. Create one in Goals →")
+            no_goals.setStyleSheet("font-size: 12px; color: #6b6962;")
+            self.dash_goals_vl.addWidget(no_goals)
+        else:
+            for goal in goals[:3]:  # show up to 3 goals
+                g_frame = QFrame()
+                g_frame.setStyleSheet(
+                    "QFrame { background: transparent; border: none; }"
+                )
+                g_vl = QVBoxLayout(g_frame)
+                g_vl.setContentsMargins(0, 0, 0, 0)
+                g_vl.setSpacing(4)
+                goal["tracking_label"] = self._goal_tracking_label(goal)
+                metrics = self._calculate_goal_metrics(goal, assets)
+                target_amt = metrics["target_amount"]
+                current_savings = metrics["current_savings"]
+                pct = metrics["progress_pct"]
+                year_str = (goal["target_date"] or "")[:4]
+
+                header_row = QHBoxLayout()
+                g_name_lbl = QLabel(goal["name"])
+                g_name_lbl.setStyleSheet("font-size: 13px; font-weight: 600; color: #22211f; border: none;")
+                header_row.addWidget(g_name_lbl)
+                header_row.addStretch()
+                status = str(goal.get("status") or "ACTIVE").upper()
+                suffix = " (Paused)" if status == "PAUSED" else (" (Achieved)" if status == "ACHIEVED" else "")
+                target_lbl = QLabel(f"{format_compact_inr(target_amt)} by {year_str}{suffix}")
+                target_lbl.setStyleSheet("font-size: 11px; color: #6b6962; border: none;")
+                header_row.addWidget(target_lbl)
+                g_vl.addLayout(header_row)
+
+                # Progress bar
+                bar_bg = QFrame()
+                bar_bg.setFixedHeight(6)
+                bar_bg.setStyleSheet("background: #e5e4df; border-radius: 3px; border: none;")
+                bar_fill = QFrame(bar_bg)
+                bar_fill.setFixedHeight(6)
+                bar_fill.setStyleSheet("background: #2b7a52; border-radius: 3px; border: none;")
+                bar_fill.setFixedWidth(max(0, int(pct / 100 * 340)))
+                g_vl.addWidget(bar_bg)
+
+                pct_lbl = QLabel(f"{int(pct)}% complete   {format_compact_inr(current_savings)} of {format_compact_inr(target_amt)}")
+                pct_lbl.setStyleSheet("font-size: 11px; color: #6b6962; border: none;")
+                pct_lbl.setWordWrap(True)
+                g_vl.addWidget(pct_lbl)
+
+                self.dash_goals_vl.addWidget(g_frame)
+
+                # Thin divider between goals
+                if goal != goals[min(2, len(goals) - 1)]:
+                    div = QFrame()
+                    div.setFrameShape(QFrame.HLine)
+                    div.setStyleSheet("color: #e5e4df;")
+                    self.dash_goals_vl.addWidget(div)
 
 
 def run() -> None:
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
+
+    init_db()
+    settings = fetch_user_settings()
+    auto_login = bool(
+        is_auth_registered(settings)
+        and settings
+        and int(settings["keep_logged_in"] or 0) == 1
+        and int(settings["logged_in"] or 0) == 1
+    )
+
+    if not auto_login:
+        auth_dialog = AuthDialog()
+        if auth_dialog.exec() != QDialog.Accepted:
+            return
+
     window = PortfolioWindow()
     window.show()
     sys.exit(app.exec())

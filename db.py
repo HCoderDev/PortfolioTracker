@@ -246,16 +246,29 @@ def _ensure_user_settings_table(connection: sqlite3.Connection) -> None:
             email TEXT DEFAULT NULL,
             password_hash TEXT DEFAULT NULL,
             app_pin TEXT DEFAULT NULL,
-            base_currency TEXT DEFAULT 'INR'
+            base_currency TEXT DEFAULT 'INR',
+            auth_registered INTEGER NOT NULL DEFAULT 0,
+            keep_logged_in INTEGER NOT NULL DEFAULT 0,
+            logged_in INTEGER NOT NULL DEFAULT 0
         )
         """
     )
+    columns = _table_columns(connection, "user_settings")
+    if "auth_registered" not in columns:
+        connection.execute("ALTER TABLE user_settings ADD COLUMN auth_registered INTEGER NOT NULL DEFAULT 0")
+    if "keep_logged_in" not in columns:
+        connection.execute("ALTER TABLE user_settings ADD COLUMN keep_logged_in INTEGER NOT NULL DEFAULT 0")
+    if "logged_in" not in columns:
+        connection.execute("ALTER TABLE user_settings ADD COLUMN logged_in INTEGER NOT NULL DEFAULT 0")
     # Ensure the single row exists immediately so frontend can blindly query/update it
     connection.execute(
         """
         INSERT OR IGNORE INTO user_settings (id, base_currency) VALUES (1, 'INR')
         """
     )
+    connection.execute("UPDATE user_settings SET auth_registered = 0 WHERE auth_registered IS NULL")
+    connection.execute("UPDATE user_settings SET keep_logged_in = 0 WHERE keep_logged_in IS NULL")
+    connection.execute("UPDATE user_settings SET logged_in = 0 WHERE logged_in IS NULL")
 
 
 def _seed_exchange_rates(connection: sqlite3.Connection) -> None:
@@ -378,7 +391,6 @@ def init_db() -> None:
         _ensure_goals_tables(connection)
         _seed_exchange_rates(connection)
         _migrate_assets(connection)
-        _seed_default_assets(connection)
 
 
 def fetch_assets(category_key: str | None = None, class_key: str | None = None) -> list[sqlite3.Row]:
@@ -919,6 +931,85 @@ def fetch_user_settings() -> sqlite3.Row | None:
         return connection.execute("SELECT * FROM user_settings WHERE id = 1").fetchone()
 
 
+def register_auth_user(
+    display_name: str,
+    email: str,
+    password_hash: str,
+    app_pin: str | None,
+    keep_logged_in: bool,
+) -> None:
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE user_settings
+            SET
+                display_name = ?,
+                email = ?,
+                password_hash = ?,
+                app_pin = ?,
+                auth_registered = 1,
+                keep_logged_in = ?,
+                logged_in = 1
+            WHERE id = 1
+            """,
+            (
+                display_name,
+                email,
+                password_hash,
+                app_pin,
+                1 if keep_logged_in else 0,
+            ),
+        )
+        connection.commit()
+
+
+def update_auth_session(logged_in: bool, keep_logged_in: bool | None = None) -> None:
+    with get_connection() as connection:
+        if keep_logged_in is None:
+            connection.execute(
+                "UPDATE user_settings SET logged_in = ? WHERE id = 1",
+                (1 if logged_in else 0,),
+            )
+        else:
+            connection.execute(
+                "UPDATE user_settings SET logged_in = ?, keep_logged_in = ? WHERE id = 1",
+                (1 if logged_in else 0, 1 if keep_logged_in else 0),
+            )
+        connection.commit()
+
+
+def clear_auth_session() -> None:
+    with get_connection() as connection:
+        connection.execute(
+            "UPDATE user_settings SET logged_in = 0, keep_logged_in = 0 WHERE id = 1"
+        )
+        connection.commit()
+
+
+def reset_auth_password(email: str, app_pin: str, new_password_hash: str) -> bool:
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT email, app_pin, auth_registered FROM user_settings WHERE id = 1"
+        ).fetchone()
+        if row is None or int(row["auth_registered"] or 0) != 1:
+            return False
+        if (row["email"] or "").strip().casefold() != email.strip().casefold():
+            return False
+        if (row["app_pin"] or "").strip() != app_pin.strip():
+            return False
+
+        connection.execute(
+            """
+            UPDATE user_settings
+            SET password_hash = ?, logged_in = 0, keep_logged_in = 0
+            WHERE id = 1
+            """,
+            (new_password_hash,),
+        )
+        connection.commit()
+        return True
+
+
 def update_financial_profile(
     age: int | None, income: float | None, expense: float | None, savings: float | None
 ) -> None:
@@ -977,10 +1068,27 @@ def _ensure_goals_tables(connection: sqlite3.Connection) -> None:
             currency TEXT DEFAULT 'INR',
             target_date TEXT NOT NULL,
             expected_return_pct REAL DEFAULT 7.0,
-            asset_class_key TEXT
+            asset_class_key TEXT,
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            paused_at TEXT,
+            achieved_at TEXT
         )
         """
     )
+    columns = _table_columns(connection, "goals")
+    if "status" not in columns:
+        connection.execute("ALTER TABLE goals ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE'")
+    if "created_at" not in columns:
+        connection.execute("ALTER TABLE goals ADD COLUMN created_at TEXT")
+    if "paused_at" not in columns:
+        connection.execute("ALTER TABLE goals ADD COLUMN paused_at TEXT")
+    if "achieved_at" not in columns:
+        connection.execute("ALTER TABLE goals ADD COLUMN achieved_at TEXT")
+    connection.execute("UPDATE goals SET status = UPPER(COALESCE(status, 'ACTIVE'))")
+    connection.execute("UPDATE goals SET status = 'ACTIVE' WHERE status NOT IN ('ACTIVE', 'PAUSED', 'ACHIEVED')")
+    connection.execute("UPDATE goals SET created_at = CURRENT_TIMESTAMP WHERE COALESCE(created_at, '') = ''")
+
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS goal_linked_assets (
@@ -994,20 +1102,30 @@ def _ensure_goals_tables(connection: sqlite3.Connection) -> None:
     )
 
 
-def create_goal(name: str, target_amount: float, target_date: str, expected_return_pct: float, asset_class_key: str | None, linked_asset_ids: list[int] = []) -> int:
+def create_goal(
+    name: str,
+    target_amount: float,
+    target_date: str,
+    expected_return_pct: float,
+    asset_class_key: str | None,
+    linked_asset_ids: list[int] | None = None,
+) -> int:
+    asset_ids = linked_asset_ids or []
     with get_connection() as connection:
         cursor = connection.cursor()
         cursor.execute(
             """
-            INSERT INTO goals (name, target_amount, currency, target_date, expected_return_pct, asset_class_key)
-            VALUES (?, ?, 'INR', ?, ?, ?)
+            INSERT INTO goals (
+                name, target_amount, currency, target_date, expected_return_pct, asset_class_key, status, created_at
+            )
+            VALUES (?, ?, 'INR', ?, ?, ?, 'ACTIVE', CURRENT_TIMESTAMP)
             """,
             (name, target_amount, target_date, expected_return_pct, asset_class_key)
         )
         goal_id = cursor.lastrowid
         
-        if linked_asset_ids:
-            for aid in linked_asset_ids:
+        if asset_ids:
+            for aid in asset_ids:
                 cursor.execute("INSERT INTO goal_linked_assets (goal_id, asset_id) VALUES (?, ?)", (goal_id, aid))
         
         connection.commit()
@@ -1016,7 +1134,24 @@ def create_goal(name: str, target_amount: float, target_date: str, expected_retu
 
 def fetch_goals() -> list[dict]:
     with get_connection() as connection:
-        goals = connection.execute("SELECT * FROM goals").fetchall()
+        goals = connection.execute(
+            """
+            SELECT
+                id,
+                name,
+                target_amount,
+                currency,
+                target_date,
+                expected_return_pct,
+                asset_class_key,
+                COALESCE(status, 'ACTIVE') AS status,
+                COALESCE(created_at, '') AS created_at,
+                paused_at,
+                achieved_at
+            FROM goals
+            ORDER BY id DESC
+            """
+        ).fetchall()
         result = []
         for g in goals:
             goal_dict = dict(g)
@@ -1024,6 +1159,109 @@ def fetch_goals() -> list[dict]:
             goal_dict["linked_asset_ids"] = [l["asset_id"] for l in links]
             result.append(goal_dict)
         return result
+
+
+def fetch_goal_by_id(goal_id: int) -> dict | None:
+    with get_connection() as connection:
+        goal_row = connection.execute(
+            """
+            SELECT
+                id,
+                name,
+                target_amount,
+                currency,
+                target_date,
+                expected_return_pct,
+                asset_class_key,
+                COALESCE(status, 'ACTIVE') AS status,
+                COALESCE(created_at, '') AS created_at,
+                paused_at,
+                achieved_at
+            FROM goals
+            WHERE id = ?
+            """,
+            (goal_id,),
+        ).fetchone()
+        if goal_row is None:
+            return None
+        goal_dict = dict(goal_row)
+        links = connection.execute(
+            "SELECT asset_id FROM goal_linked_assets WHERE goal_id = ?",
+            (goal_id,),
+        ).fetchall()
+        goal_dict["linked_asset_ids"] = [l["asset_id"] for l in links]
+        return goal_dict
+
+
+def update_goal(
+    goal_id: int,
+    name: str,
+    target_amount: float,
+    target_date: str,
+    expected_return_pct: float,
+    asset_class_key: str | None,
+    linked_asset_ids: list[int] | None = None,
+) -> None:
+    asset_ids = linked_asset_ids or []
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE goals
+            SET
+                name = ?,
+                target_amount = ?,
+                target_date = ?,
+                expected_return_pct = ?,
+                asset_class_key = ?
+            WHERE id = ?
+            """,
+            (name, target_amount, target_date, expected_return_pct, asset_class_key, goal_id),
+        )
+        connection.execute("DELETE FROM goal_linked_assets WHERE goal_id = ?", (goal_id,))
+        for aid in asset_ids:
+            connection.execute("INSERT INTO goal_linked_assets (goal_id, asset_id) VALUES (?, ?)", (goal_id, aid))
+        connection.commit()
+
+
+def update_goal_status(goal_id: int, status: str) -> None:
+    normalized = (status or "ACTIVE").strip().upper()
+    if normalized not in {"ACTIVE", "PAUSED", "ACHIEVED"}:
+        raise ValueError(f"Unsupported goal status: {status}")
+
+    with get_connection() as connection:
+        if normalized == "PAUSED":
+            connection.execute(
+                """
+                UPDATE goals
+                SET status = 'PAUSED',
+                    paused_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (goal_id,),
+            )
+        elif normalized == "ACHIEVED":
+            connection.execute(
+                """
+                UPDATE goals
+                SET status = 'ACHIEVED',
+                    achieved_at = CURRENT_TIMESTAMP,
+                    paused_at = NULL
+                WHERE id = ?
+                """,
+                (goal_id,),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE goals
+                SET status = 'ACTIVE',
+                    paused_at = NULL,
+                    achieved_at = NULL
+                WHERE id = ?
+                """,
+                (goal_id,),
+            )
+        connection.commit()
 
 
 def delete_goal(goal_id: int) -> None:
