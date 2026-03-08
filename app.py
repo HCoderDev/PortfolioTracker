@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime
 import hashlib
+import json
+from pathlib import Path
 import re
+import ssl
 import sys
 import unicodedata
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from PySide6.QtCore import QDateTime, QEvent, QItemSelectionModel, QMargins, QPoint, QPointF, QSize, QTimer, Qt, QObject
 from PySide6.QtCharts import QCategoryAxis, QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
@@ -12,6 +17,7 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QIcon,
+    QPalette,
     QPainter,
     QPainterPath,
     QPen,
@@ -69,6 +75,7 @@ from db import (
     fetch_snapshot_asset_items,
     fetch_snapshot_liability_items,
     init_db,
+    upsert_exchange_rates,
     update_asset_details,
     update_liability,
     update_asset_tag,
@@ -989,6 +996,11 @@ class PortfolioWindow(QMainWindow):
         self._syncing_selection = False
         self.row_action_icons: dict[str, QIcon] = {}
         self.nav_buttons: dict[str, QPushButton] = {}
+        self.dark_mode_button: QPushButton | None = None
+        self.theme_button: QPushButton | None = None
+        self.dark_mode_enabled = False
+        app = QApplication.instance()
+        self._default_palette = app.palette() if app is not None else None
         self.page_size = 10
         self.current_page = 1
         self.total_pages = 1
@@ -997,6 +1009,7 @@ class PortfolioWindow(QMainWindow):
         self.setMinimumSize(1380, 900)
         self._apply_style()
         self._build_ui()
+        self._refresh_theme_controls()
         self._populate_add_asset_class_tiles()
         self._populate_edit_asset_class_combo()
         self._set_add_form_visibility(False)
@@ -1049,6 +1062,11 @@ class PortfolioWindow(QMainWindow):
             QPushButton#navItem[active="true"] {
                 background: #dce8e2;
                 color: #185f3f;
+                font-weight: 700;
+            }
+            QPushButton#navItem[darkEnabled="true"] {
+                background: #e1efe7;
+                color: #1d7a4f;
                 font-weight: 700;
             }
             QFrame#profileBar {
@@ -1654,6 +1672,194 @@ class PortfolioWindow(QMainWindow):
             """
         )
 
+    def _theme_muted_text_color(self) -> str:
+        return "#aeb7c2" if self.dark_mode_enabled else "#6b6962"
+
+    def _theme_positive_text_color(self) -> str:
+        return "#59d694" if self.dark_mode_enabled else "#2b7a52"
+
+    def _theme_negative_text_color(self) -> str:
+        return "#ff8c82" if self.dark_mode_enabled else "#c23b31"
+
+    def _dark_mode_color_map(self) -> list[tuple[str, str]]:
+        return [
+            ("#fbfbf9", "#1a2028"),
+            ("#f8f8f6", "#1b222b"),
+            ("#f7f7f5", "#10151b"),
+            ("#f5f5f3", "#1d242d"),
+            ("#f4f4f2", "#1f262f"),
+            ("#f4f4f1", "#1f262f"),
+            ("#f3f3f1", "#202833"),
+            ("#f3f2ef", "#202833"),
+            ("#f3f2ee", "#222b36"),
+            ("#f2f1ed", "#212934"),
+            ("#f1f0ec", "#222b35"),
+            ("#efefee", "#141a22"),
+            ("#efefec", "#1f2731"),
+            ("#ecebe7", "#27303c"),
+            ("#ecebe6", "#27303c"),
+            ("#eaf3ee", "#1b322a"),
+            ("#e8e7e3", "#1e2630"),
+            ("#e6e5e1", "#26303c"),
+            ("#e5e4df", "#2d3744"),
+            ("#e4e2db", "#2d3744"),
+            ("#e2b1ad", "#5e3a38"),
+            ("#e1e0db", "#2b3643"),
+            ("#dfe8f7", "#243246"),
+            ("#dfddd7", "#2d3744"),
+            ("#deefe4", "#1f3b31"),
+            ("#dddcd7", "#33404e"),
+            ("#dce8e2", "#214437"),
+            ("#d9d8d3", "#364352"),
+            ("#d8d7d2", "#344252"),
+            ("#d5d4cf", "#33414f"),
+            ("#fff5f4", "#422625"),
+            ("#ffeceb", "#512d2c"),
+            ("#f8e2df", "#5a3432"),
+            ("#f4edda", "#433723"),
+            ("#dfe8e3", "#204336"),
+            ("#5a7e67", "#89d9ac"),
+            ("#9f7a1d", "#f4c76b"),
+            ("#2e5082", "#9fc2ff"),
+            ("#2f2e2b", "#e6ebf2"),
+            ("#2e2d2a", "#e1e7f0"),
+            ("#292825", "#dfe6f1"),
+            ("#252421", "#ecf1f8"),
+            ("#232220", "#ecf1f8"),
+            ("#22211f", "#f1f5fb"),
+            ("#1a1917", "#ffffff"),
+            ("#696761", "#aeb7c2"),
+            ("#6f6c66", "#aeb7c2"),
+            ("#6b6962", "#aeb7c2"),
+            ("#67655f", "#aeb7c2"),
+            ("#65635d", "#aeb7c2"),
+            ("#5f5d57", "#b8c1cd"),
+            ("#5e5c57", "#b8c1cd"),
+            ("#5a5853", "#c1cad6"),
+            ("#57554f", "#c1cad6"),
+            ("#55534d", "#c1cad6"),
+            ("#4f4d47", "#cad3df"),
+            ("#4d4b46", "#cad3df"),
+            ("#4a4945", "#d2dae6"),
+            ("#3f3e3a", "#d6deea"),
+            ("#3c3b37", "#d6deea"),
+            ("#363530", "#dce4ef"),
+            ("#343330", "#dce4ef"),
+            ("#32312d", "#dce4ef"),
+            ("#256d46", "#3ea86f"),
+            ("#1d5c3a", "#3d9a67"),
+            ("#2b8055", "#62d49b"),
+            ("#2f7b55", "#62d49b"),
+            ("#1d7a4f", "#57d398"),
+            ("#2b7a52", "#59d694"),
+            ("#1f6d45", "#3ea86f"),
+            ("#185f3f", "#4bc489"),
+            ("#cc4b38", "#ff8c82"),
+            ("#c23b31", "#ff7f75"),
+            ("#b13c33", "#ff7f75"),
+            ("#3b3a36", "#c8d1dd"),
+        ]
+
+    def _darken_stylesheet(self, stylesheet: str) -> str:
+        transformed = stylesheet
+        transformed = re.sub(
+            r"(background(?:-color)?\s*:\s*)#ffffff",
+            r"\1#151a21",
+            transformed,
+            flags=re.IGNORECASE,
+        )
+        for light_hex, dark_hex in self._dark_mode_color_map():
+            transformed = re.sub(re.escape(light_hex), dark_hex, transformed, flags=re.IGNORECASE)
+        return transformed
+
+    def _iter_theme_widgets(self) -> list[QWidget]:
+        return [self, *self.findChildren(QWidget)]
+
+    def _apply_dark_palette(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+
+        palette = QPalette()
+        palette.setColor(QPalette.Window, QColor("#10151b"))
+        palette.setColor(QPalette.WindowText, QColor("#e6ebf2"))
+        palette.setColor(QPalette.Base, QColor("#151a21"))
+        palette.setColor(QPalette.AlternateBase, QColor("#1b222b"))
+        palette.setColor(QPalette.ToolTipBase, QColor("#1b222b"))
+        palette.setColor(QPalette.ToolTipText, QColor("#f1f5fb"))
+        palette.setColor(QPalette.Text, QColor("#e6ebf2"))
+        palette.setColor(QPalette.Button, QColor("#1a2028"))
+        palette.setColor(QPalette.ButtonText, QColor("#e6ebf2"))
+        palette.setColor(QPalette.BrightText, QColor("#ffffff"))
+        palette.setColor(QPalette.Highlight, QColor("#3ea86f"))
+        palette.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+        palette.setColor(QPalette.PlaceholderText, QColor("#99a4b2"))
+        app.setPalette(palette)
+
+    def _restore_default_palette(self) -> None:
+        app = QApplication.instance()
+        if app is None or self._default_palette is None:
+            return
+        app.setPalette(self._default_palette)
+
+    def _apply_dark_mode_widget_styles(self, force: bool = False) -> None:
+        for widget in self._iter_theme_widgets():
+            if widget.property("_lightStyleSheet") is None:
+                widget.setProperty("_lightStyleSheet", widget.styleSheet())
+                light_stylesheet = widget.styleSheet()
+                if isinstance(light_stylesheet, str) and light_stylesheet:
+                    widget.setStyleSheet(self._darken_stylesheet(light_stylesheet))
+                continue
+
+            if not force:
+                continue
+
+            light_stylesheet = widget.property("_lightStyleSheet")
+            if isinstance(light_stylesheet, str) and light_stylesheet:
+                widget.setStyleSheet(self._darken_stylesheet(light_stylesheet))
+
+    def _restore_light_widget_styles(self) -> None:
+        for widget in self._iter_theme_widgets():
+            light_stylesheet = widget.property("_lightStyleSheet")
+            if isinstance(light_stylesheet, str):
+                widget.setStyleSheet(light_stylesheet)
+
+    def _refresh_theme_controls(self) -> None:
+        if self.theme_button is not None:
+            self.theme_button.setText("Sun" if self.dark_mode_enabled else "Moon")
+
+        if self.dark_mode_button is not None:
+            self.dark_mode_button.setProperty("darkEnabled", self.dark_mode_enabled)
+            self.dark_mode_button.style().unpolish(self.dark_mode_button)
+            self.dark_mode_button.style().polish(self.dark_mode_button)
+
+    def _apply_theme_if_needed(self) -> None:
+        if not self.dark_mode_enabled:
+            return
+        self._apply_dark_mode_widget_styles(force=False)
+
+    def _toggle_dark_mode(self, enabled: bool | None = None) -> None:
+        target_state = (not self.dark_mode_enabled) if enabled is None else bool(enabled)
+        if target_state == self.dark_mode_enabled:
+            return
+
+        self.dark_mode_enabled = target_state
+        if self.dark_mode_enabled:
+            self._apply_dark_palette()
+            self._apply_dark_mode_widget_styles(force=True)
+            self._show_toast("Dark mode enabled")
+        else:
+            self._restore_default_palette()
+            self._restore_light_widget_styles()
+            self._show_toast("Dark mode disabled")
+
+        self._refresh_theme_controls()
+        self._refresh_assets_view()
+        self._refresh_liabilities_view()
+        self._refresh_net_worth_view()
+        self._refresh_goals_view()
+        self._refresh_dashboard_view()
+
     def _build_ui(self) -> None:
         root = QWidget()
         root_layout = QHBoxLayout(root)
@@ -1680,8 +1886,7 @@ class PortfolioWindow(QMainWindow):
             ("OVERVIEW", ["Dashboard"]),
             ("WEALTH", ["Assets", "Liabilities", "Net Worth"]),
             ("PLAN", ["Essentials", "Goals", "Allocation"]),
-            ("MONEY", ["Income", "Expenses", "Insights"]),
-            ("DATA", ["Install App", "Dark mode", "Feedback"]),
+            ("DATA", ["Dark mode"]),
         ]
         for group, items in menu_sections:
             group_label = QLabel(group)
@@ -1692,12 +1897,14 @@ class PortfolioWindow(QMainWindow):
                 button.setObjectName("navItem")
                 button.setProperty("active", item == "Dashboard")
                 button.setCursor(Qt.PointingHandCursor)
-                if item in {"Dashboard", "Assets", "Liabilities", "Net Worth", "Essentials", "Allocation", "Goals"}:
+                if item in {"Dashboard", "Assets", "Liabilities", "Net Worth", "Essentials", "Allocation", "Goals", "Dark mode"}:
                     button.clicked.connect(
                         lambda _checked=False, selected_item=item: self._on_sidebar_navigation(selected_item)
                     )
                 layout.addWidget(button)
                 self.nav_buttons[item] = button
+                if item == "Dark mode":
+                    self.dark_mode_button = button
             layout.addSpacing(6)
 
         layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding))
@@ -1731,10 +1938,11 @@ class PortfolioWindow(QMainWindow):
         layout.setContentsMargins(20, 8, 20, 8)
         layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
 
-        theme_button = QPushButton("Moon")
-        theme_button.setObjectName("iconButton")
-        theme_button.setCursor(Qt.PointingHandCursor)
-        layout.addWidget(theme_button)
+        self.theme_button = QPushButton("Moon")
+        self.theme_button.setObjectName("iconButton")
+        self.theme_button.setCursor(Qt.PointingHandCursor)
+        self.theme_button.clicked.connect(lambda _checked=False: self._toggle_dark_mode())
+        layout.addWidget(self.theme_button)
 
         self.profile_user_label = QLabel("")
         self.profile_user_label.setObjectName("userLabel")
@@ -1761,11 +1969,18 @@ class PortfolioWindow(QMainWindow):
         if not hasattr(self, "profile_menu_button"):
             return
         menu = QMenu(self)
-        menu.setStyleSheet(
-            "QMenu { background: #ffffff; border: 1px solid #d9d8d3; padding: 4px 0; }"
-            "QMenu::item { padding: 8px 16px; color: #22211f; }"
-            "QMenu::item:selected { background: #f3f2ef; }"
-        )
+        if self.dark_mode_enabled:
+            menu.setStyleSheet(
+                "QMenu { background: #151a21; border: 1px solid #364352; padding: 4px 0; }"
+                "QMenu::item { padding: 8px 16px; color: #e6ebf2; }"
+                "QMenu::item:selected { background: #222b36; }"
+            )
+        else:
+            menu.setStyleSheet(
+                "QMenu { background: #ffffff; border: 1px solid #d9d8d3; padding: 4px 0; }"
+                "QMenu::item { padding: 8px 16px; color: #22211f; }"
+                "QMenu::item:selected { background: #f3f2ef; }"
+            )
         logout_action = menu.addAction("Log out")
         chosen = menu.exec(self.profile_menu_button.mapToGlobal(QPoint(0, self.profile_menu_button.height())))
         if chosen == logout_action:
@@ -2455,6 +2670,32 @@ class PortfolioWindow(QMainWindow):
         return container
 
     def _build_settings_currency_tab(self) -> QWidget:
+        def _status_style(ok: bool) -> str:
+            if ok:
+                return (
+                    "QLabel {"
+                    "background-color: #e8f3ec; color: #2b7a52; padding: 12px; border-radius: 4px;"
+                    "font-size: 12px; border: 1px solid #cce5d6;"
+                    "}"
+                )
+            return (
+                "QLabel {"
+                "background-color: #fbeceb; color: #b9382f; padding: 12px; border-radius: 4px;"
+                "font-size: 12px; border: 1px solid #f2c8c4;"
+                "}"
+            )
+
+        def refresh_rates() -> None:
+            refresh_btn.setEnabled(False)
+            success_msg.setStyleSheet(_status_style(True))
+            success_msg.setText("Refreshing FX rates from free provider...")
+            QApplication.processEvents()
+
+            ok, status_text = self._refresh_exchange_rates_from_api()
+            success_msg.setStyleSheet(_status_style(ok))
+            success_msg.setText(status_text)
+            refresh_btn.setEnabled(True)
+
         panel = QFrame()
         panel.setObjectName("settingsPanel")
         panel.setStyleSheet(
@@ -2581,16 +2822,8 @@ class PortfolioWindow(QMainWindow):
         layout.addSpacing(16)
         
         success_msg = QLabel("✓ FX rates loaded Last updated: Just now")
-        success_msg.setStyleSheet("""
-            QLabel {
-                background-color: #e8f3ec;
-                color: #2b7a52;
-                padding: 12px;
-                border-radius: 4px;
-                font-size: 12px;
-                border: 1px solid #cce5d6;
-            }
-        """)
+        success_msg.setStyleSheet(_status_style(True))
+        refresh_btn.clicked.connect(refresh_rates)
         layout.addWidget(success_msg)
 
         layout.addStretch()
@@ -2601,6 +2834,145 @@ class PortfolioWindow(QMainWindow):
         outer_layout.addWidget(panel)
         outer_layout.addStretch()
         return outer_container
+
+    def _refresh_exchange_rates_from_api(self) -> tuple[bool, str]:
+        def _build_ssl_context() -> ssl.SSLContext:
+            try:
+                import certifi  # type: ignore
+
+                return ssl.create_default_context(cafile=certifi.where())
+            except Exception:
+                pass
+
+            for pem_path in (
+                "/etc/ssl/cert.pem",
+                "/private/etc/ssl/cert.pem",
+                "/etc/ssl/certs/ca-certificates.crt",
+            ):
+                if Path(pem_path).exists():
+                    try:
+                        return ssl.create_default_context(cafile=pem_path)
+                    except Exception:
+                        continue
+            return ssl.create_default_context()
+
+        def _read_payload(endpoint: str) -> tuple[dict[str, object], bool]:
+            request = Request(
+                endpoint,
+                headers={
+                    "User-Agent": "PortfolioTracker/1.0",
+                    "Accept": "application/json",
+                },
+            )
+            verified_ctx = _build_ssl_context()
+            try:
+                with urlopen(request, timeout=12, context=verified_ctx) as response:
+                    status = int(getattr(response, "status", 200) or 200)
+                    if status < 200 or status >= 300:
+                        raise RuntimeError(f"HTTP {status}")
+                    payload = json.loads(response.read().decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid provider payload")
+                return payload, False
+            except URLError as exc:
+                reason_text = str(getattr(exc, "reason", exc))
+                is_cert_error = "CERTIFICATE_VERIFY_FAILED" in reason_text.upper() or isinstance(
+                    getattr(exc, "reason", None), ssl.SSLCertVerificationError
+                )
+                if not is_cert_error:
+                    raise
+
+                # Fallback for Python builds missing CA bundles (common on local installs).
+                insecure_ctx = ssl._create_unverified_context()
+                with urlopen(request, timeout=12, context=insecure_ctx) as response:
+                    status = int(getattr(response, "status", 200) or 200)
+                    if status < 200 or status >= 300:
+                        raise RuntimeError(f"HTTP {status}")
+                    payload = json.loads(response.read().decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid provider payload")
+                return payload, True
+
+        endpoints = [
+            ("https://open.er-api.com/v6/latest/INR", "standard"),
+            ("https://api.exchangerate-api.com/v4/latest/INR", "standard"),
+            ("http://www.floatrates.com/daily/inr.json", "floatrates"),
+        ]
+        last_error: Exception | None = None
+        used_insecure_fallback = False
+
+        for endpoint, provider_kind in endpoints:
+            try:
+                payload, insecure_used = _read_payload(endpoint)
+                used_insecure_fallback = used_insecure_fallback or insecure_used
+
+                inr_rates: dict[str, float] = {"INR": 1.0}
+                if provider_kind == "floatrates":
+                    for raw_code, item in payload.items():
+                        code = str(raw_code or "").strip().upper()
+                        if len(code) != 3 or not code.isalpha():
+                            continue
+                        if not isinstance(item, dict):
+                            continue
+                        try:
+                            inverse_rate = float(item.get("inverseRate"))
+                        except (TypeError, ValueError):
+                            inverse_rate = 0.0
+                        if inverse_rate <= 0:
+                            continue
+                        inr_rates[code] = inverse_rate
+                else:
+                    rates_blob = payload.get("rates")
+                    if not isinstance(rates_blob, dict):
+                        rates_blob = payload.get("conversion_rates")
+                    if not isinstance(rates_blob, dict):
+                        raise ValueError("missing rates in provider response")
+
+                    for raw_code, raw_rate in rates_blob.items():
+                        code = str(raw_code or "").strip().upper()
+                        if len(code) != 3 or not code.isalpha():
+                            continue
+                        try:
+                            base_to_code = float(raw_rate)
+                        except (TypeError, ValueError):
+                            continue
+                        if base_to_code <= 0:
+                            continue
+
+                        # Provider base is INR, but DB stores 1 unit foreign currency in INR.
+                        inr_rates[code] = 1.0 / base_to_code
+
+                if "USD" not in inr_rates or "EUR" not in inr_rates or "GBP" not in inr_rates:
+                    raise ValueError("provider did not return USD/EUR/GBP rates")
+
+                upsert_exchange_rates(inr_rates)
+                self.exchange_rates = fetch_exchange_rates()
+                self._refresh_assets_view()
+                self._refresh_liabilities_view()
+                self._refresh_net_worth_view()
+                self._refresh_goals_view()
+                self._refresh_dashboard_view()
+
+                provider = endpoint.split("/")[2]
+                updated_at = datetime.now().strftime("%d %b %Y %I:%M %p")
+                usd_preview = self.exchange_rates.get("USD", 0.0)
+                if used_insecure_fallback:
+                    return (
+                        True,
+                        f"✓ FX rates refreshed from {provider} at {updated_at} (USD≈₹{usd_preview:.2f}, SSL fallback used)",
+                    )
+                return True, f"✓ FX rates refreshed from {provider} at {updated_at} (USD≈₹{usd_preview:.2f})"
+            except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+
+        reason = str(last_error) if last_error else "provider unreachable"
+        if "CERTIFICATE_VERIFY_FAILED" in reason.upper():
+            reason = (
+                f"{reason}. If this keeps happening, install Python certs or `pip install certifi`."
+            )
+        return False, f"Unable to refresh FX rates right now ({reason})."
 
     def _on_settings_tab_click(self, item_name: str, index: int) -> None:
         for name, btn in self.settings_nav_buttons.items():
@@ -4349,7 +4721,10 @@ class PortfolioWindow(QMainWindow):
             widget.style().unpolish(widget)
             widget.style().polish(widget)
 
-        row_color = QColor("#f3f2ee") if is_highlighted else QColor("#ffffff")
+        if self.dark_mode_enabled:
+            row_color = QColor("#222b36") if is_highlighted else QColor("#151a21")
+        else:
+            row_color = QColor("#f3f2ee") if is_highlighted else QColor("#ffffff")
         for item in self.asset_row_items_by_id.get(asset_id, []):
             item.setBackground(row_color)
 
@@ -4698,6 +5073,7 @@ class PortfolioWindow(QMainWindow):
 
         self._populate_assets_table()
         self._update_selection_bar()
+        self._apply_theme_if_needed()
 
     def _rebuild_category_chips(self, category_counts, total_assets_count: int) -> None:
         self._clear_layout(self.category_chip_layout)
@@ -5042,10 +5418,16 @@ class PortfolioWindow(QMainWindow):
         self._syncing_selection = False
         self._refresh_visible_row_highlights()
 
-    def _on_asset_checkbox_toggled(self, asset_id: int, state: int) -> None:
+    def _on_asset_checkbox_toggled(self, asset_id: int, state: int | Qt.CheckState) -> None:
         if self._syncing_selection:
             return
-        if state == int(Qt.CheckState.Checked):
+
+        try:
+            is_checked = Qt.CheckState(state) == Qt.CheckState.Checked
+        except Exception:
+            is_checked = state == Qt.CheckState.Checked
+
+        if is_checked:
             self.selected_asset_ids.add(asset_id)
         else:
             self.selected_asset_ids.discard(asset_id)
@@ -5055,7 +5437,7 @@ class PortfolioWindow(QMainWindow):
         if row_idx is not None and selection_model is not None:
             self._syncing_selection = True
             index = self.asset_table.model().index(row_idx, 0)
-            if state == int(Qt.CheckState.Checked):
+            if is_checked:
                 selection_model.select(index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
             else:
                 selection_model.select(index, QItemSelectionModel.Deselect | QItemSelectionModel.Rows)
@@ -5243,6 +5625,8 @@ class PortfolioWindow(QMainWindow):
             self._show_goals_page()
         elif item_name == "Dashboard":
             self._show_dashboard_page()
+        elif item_name == "Dark mode":
+            self._toggle_dark_mode()
 
     def _set_net_worth_mode(self, mode: str) -> None:
         if self.net_worth_view_mode == mode:
@@ -6009,6 +6393,7 @@ class PortfolioWindow(QMainWindow):
         if snapshot_count <= 0:
             self.net_worth_snapshot_count_label.setText("0 snapshots")
             self.take_first_snapshot_button.show()
+            self._apply_theme_if_needed()
             return
 
         oldest_snapshot = self.net_worth_snapshots[-1]
@@ -6017,10 +6402,14 @@ class PortfolioWindow(QMainWindow):
             f"{snapshot_count} snapshots · Tracking since {oldest_dt.strftime('%b %Y')}"
         )
         self.take_first_snapshot_button.hide()
+        self._apply_theme_if_needed()
 
     def _show_toast(self, message: str, duration_ms: int = 2200) -> None:
         if self.toast_widget is not None:
-            self.toast_widget.deleteLater()
+            try:
+                self.toast_widget.deleteLater()
+            except RuntimeError:
+                pass
             self.toast_widget = None
 
         toast = QFrame(self)
@@ -6041,11 +6430,17 @@ class PortfolioWindow(QMainWindow):
         self.toast_widget = toast
 
         def clear_toast() -> None:
-            if self.toast_widget is toast:
-                self.toast_widget = None
-            toast.deleteLater()
+            # Ignore stale timer callbacks for toasts that were already replaced.
+            if self.toast_widget is not toast:
+                return
+            self.toast_widget = None
+            try:
+                toast.deleteLater()
+            except RuntimeError:
+                pass
 
         QTimer.singleShot(duration_ms, clear_toast)
+        self._apply_theme_if_needed()
 
     def _open_take_snapshot_dialog(self) -> None:
         dialog = QDialog(self)
@@ -6179,11 +6574,13 @@ class PortfolioWindow(QMainWindow):
         if not self.all_liabilities:
             self.liabilities_empty_card.show()
             self.liabilities_table_card.hide()
+            self._apply_theme_if_needed()
             return
 
         self.liabilities_empty_card.hide()
         self.liabilities_table_card.show()
         self._populate_liabilities_table()
+        self._apply_theme_if_needed()
 
     def _populate_liabilities_table(self) -> None:
         liabilities = self.all_liabilities
@@ -6980,6 +7377,7 @@ class PortfolioWindow(QMainWindow):
         for col in range(0, 10):
             self.active_goals_layout.setColumnStretch(col, 0)
         self.active_goals_layout.setColumnStretch(columns, 1)
+        self._apply_theme_if_needed()
 
     def _on_create_goal(self):
         from db import create_goal
@@ -7625,8 +8023,8 @@ class PortfolioWindow(QMainWindow):
 
         # Left: net-worth value block — centered
         nw_col = QVBoxLayout()
-        nw_col.setSpacing(4)
-        nw_col.setAlignment(Qt.AlignHCenter)
+        nw_col.setSpacing(6)
+        nw_col.setAlignment(Qt.AlignCenter)
 
         self.dash_nw_label = QLabel("NET WORTH · ₹ INR")
         self.dash_nw_label.setAlignment(Qt.AlignCenter)
@@ -7639,7 +8037,7 @@ class PortfolioWindow(QMainWindow):
         self.dash_nw_value = QLabel("₹0")
         self.dash_nw_value.setAlignment(Qt.AlignCenter)
         self.dash_nw_value.setStyleSheet(
-            "font-size: 84px; font-weight: 800; color: #1d7a4f;"
+            "font-size: 98px; font-weight: 800; color: #1d7a4f;"
         )
         nw_col.addWidget(self.dash_nw_value)
 
@@ -7654,6 +8052,7 @@ class PortfolioWindow(QMainWindow):
         self.dash_sparkline_view.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.dash_sparkline_view.setFixedSize(260, 60)
         self.dash_sparkline_view.setStyleSheet("background: transparent; border: none;")
+        self.dash_sparkline_view.hide()
 
         spark_chart = QChart()
         spark_chart.setBackgroundBrush(Qt.transparent)
@@ -8081,32 +8480,36 @@ class PortfolioWindow(QMainWindow):
             delta = latest - prev
             delta_pct = (delta / prev * 100) if prev != 0 else 0
             sign = "+" if delta >= 0 else ""
-            color = "#2b7a52" if delta >= 0 else "#c23b31"
+            color = self._theme_positive_text_color() if delta >= 0 else self._theme_negative_text_color()
             self.dash_nw_delta.setText(
                 f"{sign}{format_compact_inr(delta)} ({sign}{delta_pct:.1f}%) vs last snapshot"
             )
             self.dash_nw_delta.setStyleSheet(f"font-size: 12px; color: {color};")
         elif len(snapshots) == 1:
             self.dash_nw_delta.setText("No previous snapshot to compare")
-            self.dash_nw_delta.setStyleSheet("font-size: 12px; color: #6b6962;")
+            self.dash_nw_delta.setStyleSheet(f"font-size: 12px; color: {self._theme_muted_text_color()};")
         else:
             self.dash_nw_delta.setText("No snapshots recorded yet")
-            self.dash_nw_delta.setStyleSheet("font-size: 12px; color: #6b6962;")
+            self.dash_nw_delta.setStyleSheet(f"font-size: 12px; color: {self._theme_muted_text_color()};")
 
         # ── Sparkline ───────────────────────────────────────────────────
         self.dash_spark_series.clear()
         snap_list = list(reversed(snapshots))  # oldest → newest
         if len(snap_list) >= 2:
+            self.dash_sparkline_view.show()
             for i, s in enumerate(snap_list):
                 self.dash_spark_series.append(float(i), float(s["net_worth_inr"]))
             self.dash_spark_chart.createDefaultAxes()
             for axis in self.dash_spark_chart.axes():
                 axis.setVisible(False)
         elif len(snap_list) == 1:
+            self.dash_sparkline_view.hide()
             # Single point – flat line
             v = float(snap_list[0]["net_worth_inr"])
             self.dash_spark_series.append(0, v)
             self.dash_spark_series.append(1, v)
+        else:
+            self.dash_sparkline_view.hide()
 
         # ── Mini tiles ─────────────────────────────────────────────────
         self.dash_assets_value.setText(format_compact_inr(total_assets_inr))
@@ -8403,6 +8806,8 @@ class PortfolioWindow(QMainWindow):
                     div.setFrameShape(QFrame.HLine)
                     div.setStyleSheet("color: #e5e4df;")
                     self.dash_goals_vl.addWidget(div)
+
+        self._apply_theme_if_needed()
 
 
 def run() -> None:

@@ -475,6 +475,32 @@ def fetch_exchange_rates() -> dict[str, float]:
     return rates
 
 
+def upsert_exchange_rates(rates: dict[str, float]) -> None:
+    rows: list[tuple[str, float]] = []
+    for currency_code, inr_rate in rates.items():
+        code = str(currency_code or "").strip().upper()
+        if not code:
+            continue
+        value = float(inr_rate)
+        if value <= 0:
+            continue
+        rows.append((code, value))
+
+    if not rows:
+        return
+
+    with get_connection() as connection:
+        connection.executemany(
+            """
+            INSERT INTO exchange_rates (currency_code, inr_rate)
+            VALUES (?, ?)
+            ON CONFLICT(currency_code) DO UPDATE SET inr_rate = excluded.inr_rate
+            """,
+            rows,
+        )
+        connection.commit()
+
+
 def fetch_liabilities() -> list[sqlite3.Row]:
     with get_connection() as connection:
         return connection.execute(
