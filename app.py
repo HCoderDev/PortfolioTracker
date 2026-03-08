@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
+import sqlite3
 import ssl
 import sys
 import unicodedata
@@ -996,6 +998,11 @@ class PortfolioWindow(QMainWindow):
         self._syncing_selection = False
         self.row_action_icons: dict[str, QIcon] = {}
         self.nav_buttons: dict[str, QPushButton] = {}
+        self.backup_history_entries: list[dict[str, object]] = []
+        self.backup_history_table: QTableWidget | None = None
+        self.backup_status_label: QLabel | None = None
+        self.backup_restore_button: QPushButton | None = None
+        self.drive_backup_folder_id: str | None = None
         self.dark_mode_button: QPushButton | None = None
         self.theme_button: QPushButton | None = None
         self.dark_mode_enabled = False
@@ -2169,7 +2176,8 @@ class PortfolioWindow(QMainWindow):
             "Financial Profile",
             "Profile",
             "Security",
-            "Currency & FX"
+            "Currency & FX",
+            "Data Backup",
         ]
         
         self.settings_nav_buttons = {}
@@ -2193,6 +2201,7 @@ class PortfolioWindow(QMainWindow):
         self.settings_stack.addWidget(self._build_settings_profile_tab())
         self.settings_stack.addWidget(self._build_settings_security_tab())
         self.settings_stack.addWidget(self._build_settings_currency_tab())
+        self.settings_stack.addWidget(self._build_settings_backup_tab())
 
         main_split.addWidget(self.settings_stack, 1)
         layout.addLayout(main_split)
@@ -2973,6 +2982,519 @@ class PortfolioWindow(QMainWindow):
                 f"{reason}. If this keeps happening, install Python certs or `pip install certifi`."
             )
         return False, f"Unable to refresh FX rates right now ({reason})."
+
+    def _create_db_snapshot(self, destination_path: Path) -> None:
+        source_path = Path("data/portfolio.db")
+        if not source_path.exists():
+            raise FileNotFoundError("Portfolio database not found at data/portfolio.db")
+
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        source_connection = sqlite3.connect(str(source_path))
+        try:
+            backup_connection = sqlite3.connect(str(destination_path))
+            try:
+                source_connection.backup(backup_connection)
+            finally:
+                backup_connection.close()
+        finally:
+            source_connection.close()
+
+    def _get_google_drive_service(self) -> tuple[object | None, str | None]:
+        try:
+            from google.oauth2.credentials import Credentials
+            from google_auth_oauthlib.flow import InstalledAppFlow
+            from google.auth.transport.requests import Request as GoogleAuthRequest
+            from googleapiclient.discovery import build
+        except Exception:
+            return (
+                None,
+                "Google Drive dependencies are missing. Install: "
+                "`pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib`",
+            )
+
+        client_secret_path = Path("config/google_drive_client_secrets.json")
+        token_path = Path("data/google_drive_token.json")
+        if not client_secret_path.exists():
+            return None, "Missing OAuth client file at config/google_drive_client_secrets.json"
+
+        scopes = ["https://www.googleapis.com/auth/drive.file"]
+        creds = None
+        try:
+            if token_path.exists():
+                creds = Credentials.from_authorized_user_file(str(token_path), scopes)
+        except Exception:
+            creds = None
+
+        try:
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(GoogleAuthRequest())
+                else:
+                    flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), scopes)
+                    creds = flow.run_local_server(port=0)
+
+                token_path.parent.mkdir(parents=True, exist_ok=True)
+                token_path.write_text(creds.to_json(), encoding="utf-8")
+
+            service = build("drive", "v3", credentials=creds, cache_discovery=False)
+            return service, None
+        except Exception as exc:
+            return None, f"Google Drive authentication failed: {exc}"
+
+    def _get_or_create_drive_backup_folder(self, service: object, create_if_missing: bool = True) -> tuple[str | None, str | None]:
+        if self.drive_backup_folder_id:
+            return self.drive_backup_folder_id, None
+
+        try:
+            query = (
+                "name = 'PortfolioTracker Backups' "
+                "and mimeType = 'application/vnd.google-apps.folder' "
+                "and trashed = false"
+            )
+            result = service.files().list(  # type: ignore[call-arg]
+                q=query,
+                spaces="drive",
+                pageSize=10,
+                fields="files(id,name)",
+            ).execute()
+            files = result.get("files", [])
+            if files:
+                folder_id = str(files[0].get("id"))
+                if folder_id:
+                    self.drive_backup_folder_id = folder_id
+                    return folder_id, None
+
+            if not create_if_missing:
+                return None, "Drive folder 'PortfolioTracker Backups' not found"
+
+            folder = service.files().create(  # type: ignore[call-arg]
+                body={
+                    "name": "PortfolioTracker Backups",
+                    "mimeType": "application/vnd.google-apps.folder",
+                },
+                fields="id,name",
+            ).execute()
+            folder_id = str(folder.get("id") or "")
+            if not folder_id:
+                return None, "Unable to create Drive backup folder"
+            self.drive_backup_folder_id = folder_id
+            return folder_id, None
+        except Exception as exc:
+            return None, f"Unable to access Drive backup folder: {exc}"
+
+    def _format_file_size(self, bytes_count: int) -> str:
+        value = float(max(0, bytes_count))
+        units = ["B", "KB", "MB", "GB", "TB"]
+        unit_idx = 0
+        while value >= 1024 and unit_idx < len(units) - 1:
+            value /= 1024
+            unit_idx += 1
+        if unit_idx == 0:
+            return f"{int(value)} {units[unit_idx]}"
+        return f"{value:.1f} {units[unit_idx]}"
+
+    def _set_backup_status(self, message: str, tone: str = "info") -> None:
+        if self.backup_status_label is None:
+            return
+        style_map = {
+            "info": "background: #eef4ff; color: #2a4f86; padding: 10px; border-radius: 4px; font-size: 12px;",
+            "success": "background: #e8f3ec; color: #2b7a52; padding: 10px; border-radius: 4px; font-size: 12px;",
+            "error": "background: #fbeceb; color: #b9382f; padding: 10px; border-radius: 4px; font-size: 12px;",
+        }
+        self.backup_status_label.setStyleSheet(style_map.get(tone, style_map["info"]))
+        self.backup_status_label.setText(message)
+
+    def _selected_backup_entry(self) -> dict[str, object] | None:
+        if self.backup_history_table is None:
+            return None
+        selected_rows = self.backup_history_table.selectionModel().selectedRows()
+        if not selected_rows:
+            return None
+        row_idx = selected_rows[0].row()
+        if row_idx < 0 or row_idx >= len(self.backup_history_entries):
+            return None
+        return self.backup_history_entries[row_idx]
+
+    def _refresh_backup_history(self) -> tuple[bool, str]:
+        try:
+            entries: list[dict[str, object]] = []
+
+            backup_dir = Path("data/backups")
+            if backup_dir.exists():
+                for db_file in backup_dir.glob("*.db"):
+                    try:
+                        stat = db_file.stat()
+                    except OSError:
+                        continue
+                    updated_dt = datetime.fromtimestamp(stat.st_mtime)
+                    entries.append(
+                        {
+                            "kind": "local",
+                            "source": "Local",
+                            "name": db_file.name,
+                            "updated_text": updated_dt.strftime("%d %b %Y %I:%M %p"),
+                            "size_text": self._format_file_size(int(stat.st_size)),
+                            "sort_epoch": float(stat.st_mtime),
+                            "local_path": str(db_file),
+                            "drive_file_id": "",
+                        }
+                    )
+
+            drive_note = ""
+            service, drive_error = self._get_google_drive_service()
+            if service is not None:
+                folder_id, folder_error = self._get_or_create_drive_backup_folder(service, create_if_missing=False)
+                if folder_id:
+                    query = f"'{folder_id}' in parents and trashed = false"
+                    result = service.files().list(  # type: ignore[call-arg]
+                        q=query,
+                        spaces="drive",
+                        pageSize=200,
+                        fields="files(id,name,modifiedTime,size)",
+                        orderBy="modifiedTime desc",
+                    ).execute()
+                    for file_data in result.get("files", []):
+                        raw_name = str(file_data.get("name") or "Drive backup")
+                        raw_id = str(file_data.get("id") or "")
+                        raw_modified = str(file_data.get("modifiedTime") or "")
+                        raw_size = str(file_data.get("size") or "0")
+                        try:
+                            size_bytes = int(raw_size)
+                        except ValueError:
+                            size_bytes = 0
+                        sort_epoch = 0.0
+                        updated_text = raw_modified
+                        if raw_modified:
+                            try:
+                                modified_dt = datetime.fromisoformat(raw_modified.replace("Z", "+00:00"))
+                                sort_epoch = modified_dt.timestamp()
+                                updated_text = modified_dt.astimezone().strftime("%d %b %Y %I:%M %p")
+                            except ValueError:
+                                updated_text = raw_modified
+                        entries.append(
+                            {
+                                "kind": "drive",
+                                "source": "Google Drive",
+                                "name": raw_name,
+                                "updated_text": updated_text,
+                                "size_text": self._format_file_size(size_bytes),
+                                "sort_epoch": sort_epoch,
+                                "local_path": "",
+                                "drive_file_id": raw_id,
+                            }
+                        )
+                elif folder_error:
+                    drive_note = folder_error
+            elif drive_error:
+                drive_note = drive_error
+
+            entries.sort(key=lambda row: float(row.get("sort_epoch", 0.0)), reverse=True)
+            self.backup_history_entries = entries
+
+            if self.backup_history_table is not None:
+                table = self.backup_history_table
+                table.blockSignals(True)
+                table.setRowCount(len(entries))
+                for row_idx, entry in enumerate(entries):
+                    table.setItem(row_idx, 0, QTableWidgetItem(str(entry.get("source", ""))))
+                    table.setItem(row_idx, 1, QTableWidgetItem(str(entry.get("name", ""))))
+                    table.setItem(row_idx, 2, QTableWidgetItem(str(entry.get("updated_text", ""))))
+                    table.setItem(row_idx, 3, QTableWidgetItem(str(entry.get("size_text", ""))))
+                table.blockSignals(False)
+                self._on_backup_history_selection_changed()
+
+            base_message = f"Loaded {len(entries)} backup entr{'y' if len(entries) == 1 else 'ies'}"
+            if drive_note:
+                return True, f"{base_message}. Drive note: {drive_note}"
+            return True, base_message
+        except Exception as exc:
+            return False, f"Unable to load backup history: {exc}"
+
+    def _on_backup_history_selection_changed(self) -> None:
+        if self.backup_restore_button is None:
+            return
+        self.backup_restore_button.setEnabled(self._selected_backup_entry() is not None)
+
+    def _restore_database_from_snapshot(self, source_snapshot: Path) -> None:
+        if not source_snapshot.exists():
+            raise FileNotFoundError(f"Snapshot not found: {source_snapshot}")
+
+        db_path = Path("data/portfolio.db")
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        source_connection = sqlite3.connect(str(source_snapshot))
+        try:
+            destination_connection = sqlite3.connect(str(db_path))
+            try:
+                source_connection.backup(destination_connection)
+            finally:
+                destination_connection.close()
+        finally:
+            source_connection.close()
+
+    def _restore_selected_backup(self) -> None:
+        selected = self._selected_backup_entry()
+        if selected is None:
+            self._set_backup_status("Select a backup entry first.", "error")
+            return
+
+        backup_name = str(selected.get("name") or "backup")
+        choice = QMessageBox.question(
+            self,
+            "Restore backup",
+            (
+                f"Restore database from '{backup_name}'?\n\n"
+                "Current data will be overwritten after creating a safety backup."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if choice != QMessageBox.Yes:
+            return
+
+        try:
+            self._set_backup_status("Preparing restore...", "info")
+            QApplication.processEvents()
+
+            safety_path = Path("data/backups") / f"pre-restore-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+            self._create_db_snapshot(safety_path)
+
+            restore_source_path: Path
+            kind = str(selected.get("kind") or "")
+            if kind == "local":
+                restore_source_path = Path(str(selected.get("local_path") or ""))
+            else:
+                drive_file_id = str(selected.get("drive_file_id") or "")
+                if not drive_file_id:
+                    raise RuntimeError("Selected Drive backup has no file id")
+
+                service, service_error = self._get_google_drive_service()
+                if service is None:
+                    raise RuntimeError(service_error or "Drive authentication unavailable")
+
+                from googleapiclient.http import MediaIoBaseDownload
+
+                restore_source_path = Path("data/backups") / (
+                    f"restore-{drive_file_id[:10]}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+                )
+                restore_source_path.parent.mkdir(parents=True, exist_ok=True)
+                request = service.files().get_media(fileId=drive_file_id)  # type: ignore[call-arg]
+                with io.FileIO(str(restore_source_path), "wb") as file_handle:
+                    downloader = MediaIoBaseDownload(file_handle, request)
+                    done = False
+                    while not done:
+                        _status, done = downloader.next_chunk()
+
+            self._restore_database_from_snapshot(restore_source_path)
+            self.exchange_rates = fetch_exchange_rates()
+            self.snapshot_assets_cache.clear()
+            self.snapshot_liabilities_cache.clear()
+            self.expanded_snapshot_ids.clear()
+            self._refresh_assets_view()
+            self._refresh_liabilities_view()
+            self._refresh_net_worth_view()
+            self._refresh_goals_view()
+            self._refresh_dashboard_view()
+
+            self._set_backup_status(f"Database restored from '{backup_name}'.", "success")
+            self._show_toast("Backup restored")
+            self._refresh_backup_history()
+        except Exception as exc:
+            self._set_backup_status(f"Restore failed: {exc}", "error")
+
+    def _backup_db_to_google_drive(self) -> tuple[bool, str]:
+        try:
+            from googleapiclient.http import MediaFileUpload
+        except Exception:
+            return (
+                False,
+                "Google Drive dependencies are missing. Install: "
+                "`pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib`",
+            )
+
+        service, service_error = self._get_google_drive_service()
+        if service is None:
+            return False, str(service_error or "Google Drive authentication unavailable")
+
+        folder_id, folder_error = self._get_or_create_drive_backup_folder(service, create_if_missing=True)
+        if not folder_id:
+            return False, str(folder_error or "Unable to access Drive backup folder")
+
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            snapshot_path = Path("data/backups") / f"portfolio-{timestamp}.db"
+            self._create_db_snapshot(snapshot_path)
+
+            file_metadata = {"name": snapshot_path.name, "parents": [folder_id]}
+            media = MediaFileUpload(
+                str(snapshot_path),
+                mimetype="application/x-sqlite3",
+                resumable=False,
+            )
+            uploaded = service.files().create(  # type: ignore[call-arg]
+                body=file_metadata,
+                media_body=media,
+                fields="id,name",
+            ).execute()
+
+            uploaded_name = str(uploaded.get("name") or snapshot_path.name)
+            return True, f"Backup uploaded to Google Drive folder: {uploaded_name}"
+        except Exception as exc:
+            return False, f"Backup failed: {exc}"
+
+    def _build_settings_backup_tab(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("settingsPanel")
+        panel.setStyleSheet(
+            """
+            QFrame#settingsPanel {
+                background-color: #ffffff;
+                border: 1px solid #d9d8d3;
+                border-radius: 6px;
+            }
+            QLabel#settingsPanelTitle {
+                font-family: "Segoe UI", sans-serif;
+                font-size: 14px;
+                font-weight: bold;
+                color: #22211f;
+            }
+            QLabel#settingsPanelDesc {
+                font-family: "Segoe UI", sans-serif;
+                font-size: 12px;
+                color: #6b6962;
+                line-height: 1.5;
+            }
+            """
+        )
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(32, 28, 32, 32)
+        layout.setSpacing(12)
+
+        title = QLabel("Data Backup")
+        title.setObjectName("settingsPanelTitle")
+        layout.addWidget(title)
+
+        desc = QLabel(
+            "Upload a snapshot of your local database to your Google Drive account.\n"
+            "Each click creates a new timestamped backup file."
+        )
+        desc.setObjectName("settingsPanelDesc")
+        layout.addWidget(desc)
+
+        prereq = QLabel(
+            "Setup required once:\n"
+            "1) Create OAuth Desktop credentials in Google Cloud.\n"
+            "2) Save client secret JSON as config/google_drive_client_secrets.json.\n"
+            "3) Click Backup and complete Google sign-in in browser."
+        )
+        prereq.setObjectName("settingsPanelDesc")
+        layout.addWidget(prereq)
+
+        actions_row = QHBoxLayout()
+        backup_btn = QPushButton("Backup to Google Drive")
+        backup_btn.setObjectName("saveBtn")
+        backup_btn.setCursor(Qt.PointingHandCursor)
+        backup_btn.setStyleSheet(
+            """
+            QPushButton#saveBtn {
+                background-color: #2b7a52;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 10px 24px;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 13px;
+                font-weight: 600;
+                margin-top: 8px;
+            }
+            QPushButton#saveBtn:hover {
+                background-color: #236543;
+            }
+            QPushButton#saveBtn:disabled {
+                background-color: #92bca4;
+            }
+            """
+        )
+        refresh_history_btn = QPushButton("Refresh History")
+        refresh_history_btn.setObjectName("secondaryButton")
+        refresh_history_btn.setCursor(Qt.PointingHandCursor)
+
+        restore_btn = QPushButton("Restore Selected")
+        restore_btn.setObjectName("secondaryButton")
+        restore_btn.setCursor(Qt.PointingHandCursor)
+        restore_btn.setEnabled(False)
+
+        actions_row.addWidget(backup_btn)
+        actions_row.addWidget(refresh_history_btn)
+        actions_row.addWidget(restore_btn)
+        actions_row.addStretch()
+        layout.addLayout(actions_row)
+
+        history_title = QLabel("Backup History")
+        history_title.setObjectName("settingsPanelTitle")
+        layout.addWidget(history_title)
+
+        history_table = QTableWidget(0, 4)
+        history_table.setObjectName("snapshotHistoryTable")
+        history_table.setHorizontalHeaderLabels(["Source", "Backup Name", "Updated", "Size"])
+        history_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        history_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        history_table.verticalHeader().setVisible(False)
+        history_table.setAlternatingRowColors(False)
+        history_table.setMinimumHeight(240)
+        history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        layout.addWidget(history_table)
+
+        status_label = QLabel("Ready to back up")
+        status_label.setWordWrap(True)
+        layout.addWidget(status_label)
+
+        self.backup_history_table = history_table
+        self.backup_status_label = status_label
+        self.backup_restore_button = restore_btn
+        self._set_backup_status("Ready to back up", "info")
+
+        def run_backup() -> None:
+            backup_btn.setEnabled(False)
+            self._set_backup_status("Backing up database to Google Drive...", "info")
+            QApplication.processEvents()
+
+            ok, message = self._backup_db_to_google_drive()
+            if ok:
+                self._set_backup_status(message, "success")
+                self._show_toast("Backup uploaded")
+                self._refresh_backup_history()
+            else:
+                self._set_backup_status(message, "error")
+            backup_btn.setEnabled(True)
+
+        def run_refresh_history() -> None:
+            refresh_history_btn.setEnabled(False)
+            self._set_backup_status("Refreshing backup history...", "info")
+            QApplication.processEvents()
+            ok, message = self._refresh_backup_history()
+            self._set_backup_status(message, "success" if ok else "error")
+            refresh_history_btn.setEnabled(True)
+
+        backup_btn.clicked.connect(run_backup)
+        refresh_history_btn.clicked.connect(run_refresh_history)
+        restore_btn.clicked.connect(self._restore_selected_backup)
+        history_table.itemSelectionChanged.connect(self._on_backup_history_selection_changed)
+
+        ok, message = self._refresh_backup_history()
+        self._set_backup_status(message, "success" if ok else "error")
+        layout.addStretch()
+
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.addWidget(panel)
+        container_layout.addStretch()
+        return container
 
     def _on_settings_tab_click(self, item_name: str, index: int) -> None:
         for name, btn in self.settings_nav_buttons.items():
